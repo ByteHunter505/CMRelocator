@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cmrelocator"
+version = "0.1.0"
+description = "TUI for moving documents between folders in IBM Content Manager v8 via the CMIS REST API."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "bytehunter505" }]
+keywords = ["cmis", "ibm", "content-manager", "tui", "textual"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business",
+]
+dependencies = [
+    "httpx>=0.27",
+    "textual>=0.85",
+    "rich>=13.7",
+]
+
+[project.scripts]
+cmrelocator = "cmrelocator.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cmrelocator = ["py.typed"]
