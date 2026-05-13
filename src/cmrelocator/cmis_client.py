@@ -6,9 +6,14 @@ CMIS-compliant repository exposing the Browser Binding (JSON).
 Only the operations needed by CMRelocator are implemented:
 - fetch_repositories     -> service document
 - get_folder             -> object properties of a folder
+- get_type_definition    -> full type definition (id, queryName, properties)
 - list_documents_in_folder
 - list_folders_by_type   -> folders of a custom ItemType filtered by CIF
 - move_object            -> CMIS moveObject (cmisaction=move)
+
+CMIS SQL note: The OASIS CMIS 1.1 grammar does not allow quoted identifiers.
+Type and property references in queries must be the `queryName`, not the `id`.
+This client resolves queryNames automatically via getTypeDefinition.
 """
 from __future__ import annotations
 
@@ -123,6 +128,47 @@ class CmisClient:
         self._raise_for_status(resp)
         return resp.json()
 
+    async def get_type_definition(
+        self, repository_id: str, type_id: str
+    ) -> dict[str, Any]:
+        """Fetch a full type definition (includes queryName + property defs)."""
+        repo = self.repository(repository_id)
+        params = {"cmisselector": "typeDefinition", "typeId": type_id}
+        resp = await self._client.get(repo.repository_url, params=params)
+        self._raise_for_status(resp)
+        return resp.json()
+
+    async def resolve_query_names(
+        self,
+        repository_id: str,
+        type_id: str,
+        property_id: str,
+    ) -> tuple[str, str]:
+        """Return (type_queryName, property_queryName) for use in CMIS SQL."""
+        typedef = await self.get_type_definition(repository_id, type_id)
+        type_qn = typedef.get("queryName") or typedef.get("query_name")
+        if not type_qn:
+            raise CmisError(f"Type {type_id!r} has no queryName in its definition.")
+        prop_defs = typedef.get("propertyDefinitions") or {}
+        pdef = prop_defs.get(property_id)
+        if pdef is None:
+            for candidate in prop_defs.values():
+                if isinstance(candidate, dict) and candidate.get("id") == property_id:
+                    pdef = candidate
+                    break
+        if pdef is None:
+            available = list(prop_defs.keys())[:20]
+            raise CmisError(
+                f"Property {property_id!r} not defined on type {type_id!r}. "
+                f"Sample available property ids: {available}"
+            )
+        prop_qn = pdef.get("queryName") or pdef.get("query_name") or pdef.get("localName")
+        if not prop_qn:
+            raise CmisError(
+                f"Property {property_id!r} on type {type_id!r} has no queryName."
+            )
+        return type_qn, prop_qn
+
     async def list_documents_in_folder(
         self,
         repository_id: str,
@@ -136,7 +182,7 @@ class CmisClient:
             "SELECT cmis:objectId, cmis:name, cmis:contentStreamLength, "
             "cmis:contentStreamMimeType, cmis:lastModificationDate, cmis:objectTypeId "
             "FROM cmis:document "
-            f"WHERE IN_FOLDER('{folder_id}')"
+            f"WHERE IN_FOLDER({_q_literal(folder_id)})"
         )
         data = {
             "cmisaction": "query",
@@ -172,15 +218,22 @@ class CmisClient:
         cif_property: str = "clbNonGroup-BAC_CIF",
         max_items: int = 5000,
     ) -> list[CmisFolder]:
-        """Query folders of a specific custom ItemType, optionally filtering by CIF."""
+        """Query folders of a custom ItemType, optionally filtering by CIF.
+
+        Resolves the type's queryName and the CIF property's queryName via
+        getTypeDefinition, because CMIS SQL does not accept the raw ids when
+        they contain special characters (`$`, `!`, `-`, etc.).
+        """
         repo = self.repository(repository_id)
+        type_qn, cif_qn = await self.resolve_query_names(
+            repository_id, type_id, cif_property
+        )
         statement = (
-            f"SELECT cmis:objectId, cmis:name, cmis:objectTypeId, "
-            f"{_q_ident(cif_property)} "
-            f"FROM {_q_ident(type_id)}"
+            f"SELECT cmis:objectId, cmis:name, cmis:objectTypeId, {cif_qn} "
+            f"FROM {type_qn}"
         )
         if cif:
-            statement += f" WHERE {_q_ident(cif_property)} = {_q_literal(cif)}"
+            statement += f" WHERE {cif_qn} = {_q_literal(cif)}"
         data = {
             "cmisaction": "query",
             "statement": statement,
@@ -194,7 +247,11 @@ class CmisClient:
         folders: list[CmisFolder] = []
         for row in payload.get("results", []):
             props = row.get("properties", {}) or row.get("succinctProperties", {})
-            cif_val = _prop(props, cif_property)
+            # In query results, properties may be keyed by queryName (standard
+            # mode) or by id (succinct mode). Try both.
+            cif_val = _prop(props, cif_qn)
+            if cif_val is None:
+                cif_val = _prop(props, cif_property)
             folders.append(
                 CmisFolder(
                     object_id=_prop(props, "cmis:objectId") or "",
@@ -276,11 +333,6 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
-def _q_ident(name: str) -> str:
-    """Double-quote a CMIS SQL identifier (type/property name with special chars)."""
-    return '"' + name.replace('"', '""') + '"'
-
-
 def _q_literal(value: str) -> str:
-    """Single-quote a CMIS SQL string literal."""
+    """Single-quote a CMIS SQL string literal (escapes embedded single quotes)."""
     return "'" + value.replace("'", "''") + "'"
