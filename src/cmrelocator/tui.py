@@ -26,6 +26,9 @@ from cmrelocator.cmis_client import CmisClient, CmisDocument, CmisError
 @dataclass
 class DocumentRow:
     doc: CmisDocument
+    cif: str
+    source_folder_id: str
+    target_folder_id: str
     selected: bool = True
     status: str = "pending"
     error: str = ""
@@ -38,7 +41,7 @@ class CMRelocatorApp(App):
     CSS = """
     Screen { layout: vertical; }
 
-    #connection, #folders {
+    #connection, #matching {
         height: auto;
         border: round $accent;
         padding: 0 1;
@@ -68,7 +71,7 @@ class CMRelocatorApp(App):
     }
 
     Label.field {
-        width: 18;
+        width: 20;
         content-align: left middle;
     }
 
@@ -96,7 +99,7 @@ class CMRelocatorApp(App):
                 yield Static("[b]Connection[/b]")
                 with Horizontal():
                     yield Label("Service URL", classes="field")
-                    yield Input(placeholder="https://host/cmis/resources/Service", id="service_url")
+                    yield Input(placeholder="https://host/cmis/browser", id="service_url")
                 with Horizontal():
                     yield Label("Repository ID", classes="field")
                     yield Input(placeholder="REPO1", id="repo_id")
@@ -110,14 +113,20 @@ class CMRelocatorApp(App):
                     yield Button("Connect", id="connect", variant="primary")
                     yield Static("[dim]Not connected[/dim]", id="conn_status")
 
-            with Vertical(id="folders"):
-                yield Static("[b]Folders[/b]")
+            with Vertical(id="matching"):
+                yield Static("[b]Matching[/b]")
                 with Horizontal():
-                    yield Label("Source folder ID", classes="field")
-                    yield Input(placeholder="objectId of folder A", id="source_id")
+                    yield Label("Source Type ID", classes="field")
+                    yield Input(placeholder="$p!-2_BAC_01_01_01_02v-1", id="source_type")
                 with Horizontal():
-                    yield Label("Target folder ID", classes="field")
-                    yield Input(placeholder="objectId of folder B", id="target_id")
+                    yield Label("Target Type ID", classes="field")
+                    yield Input(placeholder="$p!-2_BAC_01_01_01_02v-2", id="target_type")
+                with Horizontal():
+                    yield Label("CIF (optional)", classes="field")
+                    yield Input(placeholder="empty = migrate all customers", id="cif")
+                with Horizontal():
+                    yield Label("Max documents", classes="field")
+                    yield Input(value="5000", id="max_docs", restrict=r"[0-9]*")
                 with Horizontal():
                     yield Label("Max parallel", classes="field")
                     yield Input(value="4", id="concurrency", restrict=r"[0-9]*")
@@ -142,9 +151,10 @@ class CMRelocatorApp(App):
     def on_mount(self) -> None:
         table = self.query_one("#docs", DataTable)
         table.add_column("Sel", key="sel", width=4)
-        table.add_column("Name", key="name", width=42)
+        table.add_column("CIF", key="cif", width=14)
+        table.add_column("Document", key="name", width=40)
         table.add_column("Size", key="size", width=12)
-        table.add_column("MIME", key="mime", width=24)
+        table.add_column("MIME", key="mime", width=22)
         table.add_column("Modified", key="modified", width=22)
         table.add_column("Status", key="status")
         self._log("[dim]Ready. Fill connection fields and press Connect.[/dim]")
@@ -183,7 +193,9 @@ class CMRelocatorApp(App):
             return
 
         info = repos[repo_id]
-        status.update(f"[green]Connected: {info.name} ({info.product_name} {info.product_version})[/green]")
+        status.update(
+            f"[green]Connected: {info.name} ({info.product_name} {info.product_version})[/green]"
+        )
         self._log(f"[green]Connected to {info.name}[/green]")
 
     @on(Button.Pressed, "#query")
@@ -192,24 +204,137 @@ class CMRelocatorApp(App):
         if self._client is None:
             self._log("[red]Connect first.[/red]")
             return
-        source_id = self.query_one("#source_id", Input).value.strip()
-        if not source_id:
-            self._log("[red]Provide source folder objectId.[/red]")
-            return
-        status = self.query_one("#query_status", Static)
-        status.update("[yellow]Querying...[/yellow]")
-        try:
-            docs = await self._client.list_documents_in_folder(self._repo_id, source_id)
-        except Exception as exc:
-            status.update("[red]Query failed[/red]")
-            self._log(f"[red]Query failed: {exc}[/red]")
+
+        source_type = self.query_one("#source_type", Input).value.strip()
+        target_type = self.query_one("#target_type", Input).value.strip()
+        cif = self.query_one("#cif", Input).value.strip()
+        max_docs = _safe_int(self.query_one("#max_docs", Input).value, default=5000, lo=1)
+        concurrency = _safe_int(
+            self.query_one("#concurrency", Input).value, default=4, lo=1, hi=16
+        )
+
+        if not source_type or not target_type:
+            self._log("[red]Provide source and target Type IDs.[/red]")
             return
 
-        self.rows = [DocumentRow(doc=d, selected=True) for d in docs]
+        status = self.query_one("#query_status", Static)
+        status.update("[yellow]Querying folders...[/yellow]")
+
+        try:
+            source_folders = await self._client.list_folders_by_type(
+                self._repo_id, source_type, cif=cif or None, max_items=max(1000, max_docs * 2)
+            )
+            target_folders = await self._client.list_folders_by_type(
+                self._repo_id, target_type, cif=cif or None, max_items=max(1000, max_docs * 2)
+            )
+        except Exception as exc:
+            status.update("[red]Folder query failed[/red]")
+            self._log(f"[red]Folder query failed: {exc}[/red]")
+            return
+
+        if not source_folders:
+            status.update("[red]No source folders found[/red]")
+            self._log("[red]No source folders matched.[/red]")
+            return
+
+        target_by_cif: dict[str, str] = {}
+        for tf in target_folders:
+            if not tf.cif:
+                continue
+            if tf.cif in target_by_cif:
+                self._log(
+                    f"[yellow]Multiple target folders for CIF {tf.cif}; "
+                    f"using first (1:1 assumption).[/yellow]"
+                )
+                continue
+            target_by_cif[tf.cif] = tf.object_id
+
+        pairs: list[tuple[str, str, str]] = []
+        seen_cifs: set[str] = set()
+        for sf in source_folders:
+            if not sf.cif:
+                self._log(
+                    f"[yellow]Source folder {sf.object_id} has no CIF; skipping.[/yellow]"
+                )
+                continue
+            if sf.cif in seen_cifs:
+                self._log(
+                    f"[yellow]Multiple source folders for CIF {sf.cif}; "
+                    f"using first (1:1 assumption).[/yellow]"
+                )
+                continue
+            seen_cifs.add(sf.cif)
+            target_id = target_by_cif.get(sf.cif)
+            if not target_id:
+                self._log(
+                    f"[yellow]CIF {sf.cif}: no matching target folder; skipping.[/yellow]"
+                )
+                continue
+            pairs.append((sf.cif, sf.object_id, target_id))
+
+        if not pairs:
+            status.update("[red]No matching source/target pairs[/red]")
+            self._log("[red]No source/target folder pairs found.[/red]")
+            return
+
+        status.update(
+            f"[yellow]Listing documents in {len(pairs)} folder(s)...[/yellow]"
+        )
+
+        sem = asyncio.Semaphore(concurrency)
+
+        async def list_for(cif_v: str, source_id: str, target_id: str):
+            async with sem:
+                try:
+                    docs = await self._client.list_documents_in_folder(
+                        self._repo_id, source_id
+                    )
+                except Exception as exc:
+                    self._log(
+                        f"[red]Failed to list folder {source_id} "
+                        f"(CIF {cif_v}): {exc}[/red]"
+                    )
+                    return []
+                return [(cif_v, source_id, target_id, d) for d in docs]
+
+        batches = await asyncio.gather(
+            *(list_for(c, s, t) for c, s, t in pairs)
+        )
+
+        rows: list[DocumentRow] = []
+        truncated = False
+        for batch in batches:
+            for cif_v, src, tgt, doc in batch:
+                if len(rows) >= max_docs:
+                    truncated = True
+                    break
+                rows.append(
+                    DocumentRow(
+                        doc=doc,
+                        cif=cif_v,
+                        source_folder_id=src,
+                        target_folder_id=tgt,
+                        selected=True,
+                    )
+                )
+            if truncated:
+                break
+
+        rows.sort(key=lambda r: (r.cif, r.doc.name))
+        self.rows = rows
         self._rebuild_table()
-        status.update(f"[green]{len(docs)} documents found[/green]")
-        self._log(f"[green]Found {len(docs)} documents in source folder.[/green]")
-        self.query_one("#progress", ProgressBar).update(total=len(docs), progress=0)
+
+        unique_cifs = len({r.cif for r in rows})
+        summary = f"{len(rows)} documents across {unique_cifs} CIF(s)"
+        if truncated:
+            summary += f" (truncated at max_docs={max_docs})"
+            self._log(
+                f"[yellow]Result truncated at max_docs={max_docs}. "
+                f"Raise the cap or filter by CIF to migrate the rest.[/yellow]"
+            )
+        status.update(f"[green]{summary}[/green]")
+        self._log(f"[green]{summary}[/green]")
+        self.query_one("#progress", ProgressBar).update(total=len(rows), progress=0)
 
     def _rebuild_table(self) -> None:
         table = self.query_one("#docs", DataTable)
@@ -217,6 +342,7 @@ class CMRelocatorApp(App):
         for idx, row in enumerate(self.rows):
             table.add_row(
                 _checkbox(row.selected),
+                row.cif,
                 row.doc.name,
                 _fmt_size(row.doc.content_stream_length),
                 row.doc.content_stream_mime_type or "",
@@ -285,19 +411,13 @@ class CMRelocatorApp(App):
         if self._client is None:
             self._log("[red]Connect first.[/red]")
             return
-        source_id = self.query_one("#source_id", Input).value.strip()
-        target_id = self.query_one("#target_id", Input).value.strip()
-        if not source_id or not target_id:
-            self._log("[red]Provide source and target folder objectIds.[/red]")
-            return
-        try:
-            concurrency = int(self.query_one("#concurrency", Input).value or "4")
-        except ValueError:
-            concurrency = 4
-        concurrency = max(1, min(16, concurrency))
+        concurrency = _safe_int(
+            self.query_one("#concurrency", Input).value, default=4, lo=1, hi=16
+        )
 
         targets = [
-            (idx, row) for idx, row in enumerate(self.rows)
+            (idx, row)
+            for idx, row in enumerate(self.rows)
             if row.selected and row.status != "done"
         ]
         if not targets:
@@ -320,21 +440,28 @@ class CMRelocatorApp(App):
                 self._update_row(idx)
                 try:
                     await self._client.move_object(  # type: ignore[union-attr]
-                        self._repo_id, row.doc.object_id, source_id, target_id
+                        self._repo_id,
+                        row.doc.object_id,
+                        row.source_folder_id,
+                        row.target_folder_id,
                     )
                     row.status = "done"
                     counters["ok"] += 1
-                    self._log(f"[green]OK[/green]  {row.doc.name}")
+                    self._log(f"[green]OK[/green]  CIF {row.cif} - {row.doc.name}")
                 except CmisError as exc:
                     row.status = "error"
                     row.error = str(exc)
                     counters["fail"] += 1
-                    self._log(f"[red]FAIL[/red] {row.doc.name}: {exc}")
+                    self._log(
+                        f"[red]FAIL[/red] CIF {row.cif} - {row.doc.name}: {exc}"
+                    )
                 except Exception as exc:
                     row.status = "error"
                     row.error = repr(exc)
                     counters["fail"] += 1
-                    self._log(f"[red]FAIL[/red] {row.doc.name}: {exc!r}")
+                    self._log(
+                        f"[red]FAIL[/red] CIF {row.cif} - {row.doc.name}: {exc!r}"
+                    )
                 finally:
                     self._update_row(idx)
                     progress.advance(1)
@@ -376,3 +503,15 @@ def _status_text(status: str, error: str) -> Text:
     if status == "error":
         return Text(f"ERR {error[:40]}", style="bold red")
     return Text(status)
+
+
+def _safe_int(raw: str, *, default: int, lo: int | None = None, hi: int | None = None) -> int:
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        v = default
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v

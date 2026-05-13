@@ -4,10 +4,11 @@ Minimal client targeted at IBM Content Manager v8 but compatible with any
 CMIS-compliant repository exposing the Browser Binding (JSON).
 
 Only the operations needed by CMRelocator are implemented:
-- fetch_repositories  -> service document
-- get_folder          -> object properties of a folder
+- fetch_repositories     -> service document
+- get_folder             -> object properties of a folder
 - list_documents_in_folder
-- move_object         -> CMIS moveObject (cmisaction=move)
+- list_folders_by_type   -> folders of a custom ItemType filtered by CIF
+- move_object            -> CMIS moveObject (cmisaction=move)
 """
 from __future__ import annotations
 
@@ -50,6 +51,14 @@ class CmisDocument:
     content_stream_mime_type: str | None
     last_modified: str | None
     object_type_id: str | None
+
+
+@dataclass
+class CmisFolder:
+    object_id: str
+    name: str
+    cif: str
+    object_type_id: str
 
 
 class CmisClient:
@@ -154,6 +163,48 @@ class CmisClient:
             )
         return results
 
+    async def list_folders_by_type(
+        self,
+        repository_id: str,
+        type_id: str,
+        *,
+        cif: str | None = None,
+        cif_property: str = "clbNonGroup-BAC_CIF",
+        max_items: int = 5000,
+    ) -> list[CmisFolder]:
+        """Query folders of a specific custom ItemType, optionally filtering by CIF."""
+        repo = self.repository(repository_id)
+        statement = (
+            f"SELECT cmis:objectId, cmis:name, cmis:objectTypeId, "
+            f"{_q_ident(cif_property)} "
+            f"FROM {_q_ident(type_id)}"
+        )
+        if cif:
+            statement += f" WHERE {_q_ident(cif_property)} = {_q_literal(cif)}"
+        data = {
+            "cmisaction": "query",
+            "statement": statement,
+            "searchAllVersions": "false",
+            "maxItems": str(max_items),
+            "skipCount": "0",
+        }
+        resp = await self._client.post(repo.repository_url, data=data)
+        self._raise_for_status(resp)
+        payload = resp.json()
+        folders: list[CmisFolder] = []
+        for row in payload.get("results", []):
+            props = row.get("properties", {}) or row.get("succinctProperties", {})
+            cif_val = _prop(props, cif_property)
+            folders.append(
+                CmisFolder(
+                    object_id=_prop(props, "cmis:objectId") or "",
+                    name=_prop(props, "cmis:name") or "",
+                    cif="" if cif_val is None else str(cif_val),
+                    object_type_id=_prop(props, "cmis:objectTypeId") or type_id,
+                )
+            )
+        return folders
+
     async def move_object(
         self,
         repository_id: str,
@@ -223,3 +274,13 @@ def _to_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _q_ident(name: str) -> str:
+    """Double-quote a CMIS SQL identifier (type/property name with special chars)."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _q_literal(value: str) -> str:
+    """Single-quote a CMIS SQL string literal."""
+    return "'" + value.replace("'", "''") + "'"
