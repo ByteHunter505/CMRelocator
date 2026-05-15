@@ -66,18 +66,23 @@ class CMRelocatorApp(App):
 
     #migrate-form, #search-form {
         height: auto;
-        max-height: 22;
+        max-height: 24;
     }
 
-    /* Flatten input-style widgets to a single row each so that field
-       rows do not vertically overflow into the next row. Textual's
-       defaults give Input/Select/Checkbox a `border: tall transparent`
-       that consumes 2 extra rows; we don't need it. */
-    Input, Select {
+    /* Flatten Input/Checkbox to a single row each so that field rows
+       do not vertically overflow into the next row. Textual's defaults
+       give them a `border: tall transparent` that consumes 2 extra rows;
+       we don't need it. Select is intentionally NOT flattened: its inner
+       SelectCurrent renders the selected value inside a 3-row frame, and
+       collapsing the outer Select hides that value. */
+    Input {
         width: 1fr;
         height: 1;
         border: none;
         padding: 0 1;
+    }
+    Select {
+        width: 1fr;
     }
     Checkbox {
         margin: 0 1;
@@ -86,6 +91,9 @@ class CMRelocatorApp(App):
         padding: 0 1;
         background: transparent;
     }
+
+    /* The one row that holds a Select keeps its native 3-row height. */
+    #source_kind_row { height: 3; }
 
     #actions {
         height: 3;
@@ -162,7 +170,7 @@ class CMRelocatorApp(App):
                 with VerticalScroll(id="migrate-form"):
                     with Vertical(id="matching"):
                         yield Static("[b]Matching[/b]")
-                        with Horizontal():
+                        with Horizontal(id="source_kind_row"):
                             yield Label("Source kind", classes="field")
                             yield Select(
                                 options=[
