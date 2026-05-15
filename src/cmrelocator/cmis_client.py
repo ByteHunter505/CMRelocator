@@ -336,11 +336,15 @@ class CmisClient:
     ) -> list[CmisChild]:
         """List direct children (sub-folders + documents) of a folder.
 
-        Uses the CMIS Browser Binding `children` selector, which returns all
-        child objects regardless of base type. This is what the migration
-        flow uses: each child is moved into the target folder via
-        moveObject, and CMIS atomically re-parents folders along with their
-        entire subtree.
+        Uses the CMIS Browser Binding `children` selector. Tolerant of
+        response-shape variations across CMIS implementations:
+        - The spec wraps results as `{"objects": [{"object": <data>}]}`
+          but some servers return a bare list or omit the inner "object".
+        - The list key is usually "objects"; some servers use "items".
+        - Each row may carry properties under "properties" (full mode) or
+          "succinctProperties" (succinct mode).
+
+        Returns CmisChild for each direct child regardless of base type.
         """
         repo = self.repository(repository_id)
         params = {
@@ -348,14 +352,28 @@ class CmisClient:
             "objectId": folder_id,
             "maxItems": str(max_items),
             "skipCount": "0",
+            "includeAllowableActions": "false",
         }
         resp = await self._client.get(repo.root_folder_url, params=params)
         self._raise_for_status(resp)
         payload = resp.json()
+
+        if isinstance(payload, list):
+            entries = payload
+        elif isinstance(payload, dict):
+            entries = payload.get("objects") or payload.get("items") or []
+        else:
+            entries = []
+
         results: list[CmisChild] = []
-        for entry in payload.get("objects", []):
-            obj = entry.get("object", entry)
-            props = obj.get("properties", {}) or obj.get("succinctProperties", {})
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            inner = entry.get("object")
+            obj = inner if isinstance(inner, dict) else entry
+            props = obj.get("properties") or obj.get("succinctProperties") or {}
+            if not isinstance(props, dict):
+                continue
             base_type = _prop(props, "cmis:baseTypeId") or ""
             results.append(
                 CmisChild(

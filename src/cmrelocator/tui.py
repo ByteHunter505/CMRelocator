@@ -370,6 +370,14 @@ class CMRelocatorApp(App):
             *(list_for(c, s, t) for c, s, t in pairs)
         )
 
+        total_returned = sum(len(b) for b in batches)
+        empty_pairs = sum(1 for b in batches if not b)
+        self._log(
+            f"[dim]list_children: {total_returned} item(s) across "
+            f"{len(pairs) - empty_pairs}/{len(pairs)} non-empty pair(s); "
+            f"{empty_pairs} pair(s) had no direct children.[/dim]"
+        )
+
         rows: list[ItemRow] = []
         truncated = False
         for batch in batches:
@@ -391,6 +399,7 @@ class CMRelocatorApp(App):
 
         rows.sort(key=lambda r: (r.cif, not r.item.is_folder, r.item.name))
         self.rows = rows
+        self._log(f"[dim]Rendering {len(self.rows)} row(s) in the table.[/dim]")
         self._rebuild_table()
 
         unique_cifs = len({r.cif for r in rows})
