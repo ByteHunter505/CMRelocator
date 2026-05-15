@@ -95,6 +95,11 @@ class CMRelocatorApp(App):
     /* The one row that holds a Select keeps its native 3-row height. */
     #source_kind_row { height: 3; }
 
+    #selected_type_row {
+        height: 1;
+        margin: 0 1;
+    }
+
     #actions {
         height: 3;
         padding: 0 1;
@@ -139,6 +144,11 @@ class CMRelocatorApp(App):
         super().__init__()
         self.rows: list[ItemRow] = []
         self.search_hits: list[CmisSearchResult] = []
+        # Each row in the dedup table aggregates 1..N raw hits sharing the
+        # same (name, property_value, type_id, is_folder). Preserves the
+        # object_ids per group so a row click can still report the
+        # underlying ids.
+        self.search_groups: list[tuple[tuple[str, str, str, bool], list[CmisSearchResult]]] = []
         self._client: CmisClient | None = None
         self._repo_id: str = ""
 
@@ -245,7 +255,7 @@ class CMRelocatorApp(App):
             with TabPane("Search", id="tab_search"):
                 with VerticalScroll(id="search-form"):
                     with Vertical(id="search-panel"):
-                        yield Static("[b]Search folders by a custom property[/b]")
+                        yield Static("[b]Search folders by property and/or type description[/b]")
                         with Horizontal():
                             yield Label("Folder type", classes="field")
                             yield Input(
@@ -261,8 +271,14 @@ class CMRelocatorApp(App):
                         with Horizontal():
                             yield Label("Value contains", classes="field")
                             yield Input(
-                                placeholder="case-sensitive substring (LIKE %value%)",
+                                placeholder="optional - case-sensitive substring (LIKE %value%)",
                                 id="search_value",
+                            )
+                        with Horizontal():
+                            yield Label("Type desc contains", classes="field")
+                            yield Input(
+                                placeholder="optional - case-insensitive substring on the type's description (e.g. FIRMAS)",
+                                id="search_desc",
                             )
                         with Horizontal():
                             yield Label("Max results", classes="field")
@@ -281,6 +297,13 @@ class CMRelocatorApp(App):
                     id="search_results", zebra_stripes=True, cursor_type="row"
                 )
 
+                with Horizontal(id="selected_type_row"):
+                    yield Label("Selected Type ID", classes="field")
+                    yield Input(
+                        placeholder="click a result row to populate (select with mouse + Ctrl+C / Cmd+C to copy)",
+                        id="selected_type_id",
+                    )
+
         yield RichLog(id="log", highlight=True, markup=True, wrap=True)
         yield Footer()
 
@@ -296,12 +319,15 @@ class CMRelocatorApp(App):
         table.add_column("Modified", key="modified", width=22)
         table.add_column("Status", key="status")
 
-        # Search-tab results table
+        # Search-tab results table. ObjectId is intentionally omitted --
+        # the user requested distinct rows over the 4 displayed columns
+        # only, and a row click echoes the underlying object_id(s) plus
+        # populates the "Selected Type ID" input for copy/paste.
         sr = self.query_one("#search_results", DataTable)
         sr.add_column("Name (cmis:name)", key="name", width=28)
         sr.add_column("Property value", key="value", width=34)
         sr.add_column("Type ID", key="type", width=28)
-        sr.add_column("ObjectId", key="object_id")
+        sr.add_column("Kind", key="kind", width=6)
 
         self._log("[dim]Ready. Fill connection fields and press Connect.[/dim]")
 
@@ -783,7 +809,9 @@ class CMRelocatorApp(App):
         # Wipe any previous search results before validating so a failed
         # / early-returning Search also clears stale rows.
         self.search_hits = []
+        self.search_groups = []
         self.query_one("#search_results", DataTable).clear()
+        self.query_one("#selected_type_id", Input).value = ""
 
         if self._client is None:
             self._log("[red]Connect first.[/red]")
@@ -791,11 +819,16 @@ class CMRelocatorApp(App):
         type_id = self.query_one("#search_type", Input).value.strip() or None
         prop_id = self.query_one("#search_property", Input).value.strip()
         value = self.query_one("#search_value", Input).value.strip()
+        desc = self.query_one("#search_desc", Input).value.strip()
         if not prop_id:
             self._log("[red]Provide the property to search.[/red]")
             return
-        if not value:
-            self._log("[red]Type a value substring to search for.[/red]")
+        if not value and not desc:
+            self._log(
+                "[red]Provide a Value substring, a Type description "
+                "substring, or both. Leaving them both empty would match "
+                "the entire repository.[/red]"
+            )
             return
         max_items = _safe_int(
             self.query_one("#search_max", Input).value,
@@ -805,18 +838,21 @@ class CMRelocatorApp(App):
         )
 
         status = self.query_one("#search_status", Static)
-        status.update("[yellow]Searching (LIKE, case-sensitive)...[/yellow]")
-        if type_id:
-            self._log(
-                f"[cyan]Search:[/cyan] type={type_id}  property={prop_id}  "
-                f"value LIKE '%{value}%'  (max {max_items})"
+        status.update("[yellow]Searching...[/yellow]")
+        clauses: list[str] = []
+        if value:
+            scope = (
+                f"type={type_id}"
+                if type_id
+                else f"auto-discover types defining property={prop_id}"
             )
-        else:
-            self._log(
-                f"[cyan]Search:[/cyan] auto-discovering folder types with "
-                f"property={prop_id}, then querying value LIKE '%{value}%' "
-                f"(max {max_items} per type)..."
-            )
+            clauses.append(f"property LIKE '%{value}%' on {scope}")
+        if desc:
+            clauses.append(f"type description contains {desc!r}")
+        self._log(
+            f"[cyan]Search ({' OR '.join(clauses)}):[/cyan] "
+            f"max {max_items} per type"
+        )
 
         try:
             hits, queried = await self._client.search_by_property(
@@ -824,6 +860,7 @@ class CMRelocatorApp(App):
                 prop_id,
                 value,
                 type_id=type_id,
+                description_contains=desc or None,
                 max_items_per_type=max_items,
             )
         except Exception as exc:
@@ -834,24 +871,48 @@ class CMRelocatorApp(App):
         if queried:
             summary = ", ".join(f"{t}->{qn}" for t, qn in queried)
             self._log(f"[dim]Queried {len(queried)} type(s): {summary}[/dim]")
-        hits.sort(key=lambda h: h.property_value.lower())
         self.search_hits = hits
 
-        status.update(f"[green]{len(hits)} hit(s)[/green]")
-        self._log(f"[green]Search done.[/green] {len(hits)} hit(s).")
+        # Distinct over (name, property_value, type_id, is_folder) while
+        # preserving the underlying object_ids so a row click can still
+        # report them. dict insertion order keeps a stable presentation.
+        groups: dict[tuple[str, str, str, bool], list[CmisSearchResult]] = {}
+        for h in hits:
+            key = (h.name, h.property_value, h.object_type_id, h.is_folder)
+            groups.setdefault(key, []).append(h)
+        ordered = sorted(
+            groups.items(),
+            key=lambda kv: (
+                kv[0][1].lower(),  # property value
+                kv[0][0].lower(),  # name
+                kv[0][2],          # type id
+            ),
+        )
+        self.search_groups = ordered
+
+        status.update(
+            f"[green]{len(ordered)} distinct row(s) "
+            f"({len(hits)} raw hit(s))[/green]"
+        )
+        self._log(
+            f"[green]Search done.[/green] {len(ordered)} distinct row(s) "
+            f"out of {len(hits)} raw hit(s)."
+        )
 
         table = self.query_one("#search_results", DataTable)
         table.clear()
-        for idx, h in enumerate(hits):
-            table.add_row(
-                h.name, h.property_value, h.object_type_id, h.object_id,
-                key=str(idx),
+        for idx, ((name, val, t_id, is_folder), bucket) in enumerate(ordered):
+            kind = "[F]" if is_folder else "[D]"
+            label = (
+                f"{name} ({len(bucket)})" if len(bucket) > 1 else name
             )
+            table.add_row(label, val, t_id, kind, key=str(idx))
 
-        if hits:
+        if ordered:
             self._log(
-                "[dim]Click a row to echo the full ObjectId to this log "
-                "(easy to copy into Source/Target Type ID fields).[/dim]"
+                "[dim]Click a row to copy its Type ID into the "
+                "'Selected Type ID' input and echo the underlying "
+                "ObjectId(s) to this log.[/dim]"
             )
 
     @on(DataTable.RowSelected, "#search_results")
@@ -864,13 +925,16 @@ class CMRelocatorApp(App):
             idx = int(event.row_key.value)
         except (TypeError, ValueError):
             return
-        if not (0 <= idx < len(self.search_hits)):
+        if not (0 <= idx < len(self.search_groups)):
             return
-        h = self.search_hits[idx]
+        (name, val, t_id, is_folder), bucket = self.search_groups[idx]
+        self.query_one("#selected_type_id", Input).value = t_id
+        kind = "folder" if is_folder else "document"
+        ids = ", ".join(h.object_id for h in bucket)
         self._log(
-            f"name={h.name!r}  property_value={h.property_value!r}  "
-            f"type={h.object_type_id}  "
-            f"objectId=[bold]{h.object_id}[/bold]"
+            f"name={name!r}  property_value={val!r}  "
+            f"type=[bold]{t_id}[/bold]  kind={kind}  "
+            f"objectId(s)=[bold]{ids}[/bold]"
         )
 
     # ===================== Helpers =====================

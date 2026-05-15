@@ -92,6 +92,7 @@ class CmisSearchResult:
     name: str
     object_type_id: str
     property_value: str
+    is_folder: bool = True
 
 
 class CmisClient:
@@ -333,6 +334,40 @@ class CmisClient:
             if not has_prop(parent_def):
                 frontier.append(tid)
         return frontier
+
+    async def find_types_by_description(
+        self,
+        repository_id: str,
+        pattern: str,
+        *,
+        root_type_id: str = "cmis:folder",
+        case_insensitive: bool = True,
+    ) -> list[str]:
+        """Return type ids whose `description` (type-definition metadata,
+        NOT the cmis:description property of an instance) contains `pattern`
+        as a substring.
+
+        Matches client-side over the cached type tree -- the CMIS query
+        grammar cannot filter on type-definition metadata, only on
+        queryable properties of instances.
+        """
+        if not pattern:
+            return []
+        descendants = await self.get_type_descendants(
+            repository_id, root_type_id=root_type_id
+        )
+        needle = pattern.casefold() if case_insensitive else pattern
+        out: list[str] = []
+        for t in descendants:
+            desc = t.get("description") or ""
+            if not isinstance(desc, str):
+                continue
+            hay = desc.casefold() if case_insensitive else desc
+            if needle in hay:
+                tid = t.get("id")
+                if isinstance(tid, str):
+                    out.append(tid)
+        return out
 
     async def list_documents_in_folder(
         self,
@@ -577,65 +612,84 @@ class CmisClient:
         *,
         type_id: str | None = None,
         root_type_id: str = "cmis:folder",
+        description_contains: str | None = None,
         max_items_per_type: int = 1000,
         page_size: int = 500,
     ) -> tuple[list[CmisSearchResult], list[tuple[str, str]]]:
-        """Substring search on a custom property.
+        """Additive search across two independent paths, union of results.
 
-        Runs `SELECT ... FROM <type_qn> WHERE <prop_qn> LIKE '%VALUE%'`,
-        resolving queryNames for both the type and the property. Match
-        is case-sensitive (CM v8's CMIS parser does not support UPPER()).
+        Path A (property): `SELECT ... FROM <type_qn> WHERE <prop_qn>
+        LIKE '%VALUE%'`. Runs only if `value_substring` is non-empty.
+        If `type_id` is given, queries just that type; otherwise walks
+        the subtree of `root_type_id` and queries every "frontier"
+        type that defines `property_id`.
 
-        `value_substring` is escaped for SQL single-quote literals. LIKE
-        wildcards (% and _) inside the value are NOT escaped, so they
-        act as wildcards.
+        Path B (type description): finds every type under `root_type_id`
+        whose type-definition `description` field contains
+        `description_contains` (case-insensitive substring, matched
+        client-side over the cached type tree). Runs only if
+        `description_contains` is non-empty. Each matching type is
+        queried with no WHERE clause -- returns every folder of that
+        type. Property column comes back empty for these rows since the
+        type may not even define the property.
 
-        Two modes:
+        At least one of `value_substring` and `description_contains`
+        must be non-empty.
 
-        * `type_id` provided -> single query against that type.
-        * `type_id` is None  -> walk the `root_type_id` subtree, find
-          every "frontier" type that defines `property_id`, and run one
-          query per frontier in parallel. Each FROM <type> query covers
-          all descendants of that type by CMIS default semantics, so the
-          union of results is exhaustive for the subtree.
+        A type that matches BOTH paths is queried only via Path B, which
+        is a superset, to avoid duplicate rows.
 
         `max_items_per_type` caps each individual query, NOT the total.
-        With N frontier types you may get up to N * max_items_per_type
-        rows back.
 
         Returns (hits, queried_types) where queried_types is a list of
         (type_id, type_queryName) pairs so the UI can show what was
         actually searched.
         """
-        if not value_substring:
+        has_value = bool(value_substring)
+        has_desc = bool(description_contains)
+        if not has_value and not has_desc:
             return [], []
 
-        target_types: list[str]
-        if type_id:
-            target_types = [type_id]
-        else:
-            target_types = await self.find_property_owning_types(
-                repository_id, property_id, root_type_id=root_type_id
+        prop_path_types: list[str] = []
+        if has_value:
+            if type_id:
+                prop_path_types = [type_id]
+            else:
+                prop_path_types = await self.find_property_owning_types(
+                    repository_id, property_id, root_type_id=root_type_id
+                )
+                if not prop_path_types and not has_desc:
+                    raise CmisError(
+                        f"No type under {root_type_id!r} defines property "
+                        f"{property_id!r} in this repository. Try a different "
+                        f"property id or pass an explicit Folder type."
+                    )
+
+        desc_path_types: list[str] = []
+        if has_desc:
+            desc_path_types = await self.find_types_by_description(
+                repository_id, description_contains, root_type_id=root_type_id
             )
-            if not target_types:
+            if not desc_path_types and not prop_path_types:
                 raise CmisError(
-                    f"No type under {root_type_id!r} defines property "
-                    f"{property_id!r} in this repository. Try a different "
-                    f"property id or pass an explicit Folder type."
+                    f"No type under {root_type_id!r} has a description "
+                    f"matching {description_contains!r}."
                 )
 
-        escaped = value_substring.replace("'", "''")
+        # De-overlap: types in Path B are queried without WHERE, which
+        # already covers any rows Path A would have returned for them.
+        desc_set = set(desc_path_types)
+        prop_only = [t for t in prop_path_types if t not in desc_set]
+
+        escaped = value_substring.replace("'", "''") if has_value else ""
         repo = self.repository(repository_id)
 
-        async def query_one(t_id: str) -> tuple[str, str, list[CmisSearchResult]]:
-            type_qn, prop_qn = await self.resolve_query_names(
-                repository_id, t_id, property_id
-            )
-            statement = (
-                f"SELECT cmis:objectId, cmis:name, cmis:objectTypeId, {prop_qn} "
-                f"FROM {type_qn} "
-                f"WHERE {prop_qn} LIKE '%{escaped}%'"
-            )
+        def base_type_of(typedef: dict[str, Any]) -> str:
+            return str(typedef.get("baseId") or typedef.get("baseTypeId") or "")
+
+        async def run_query(
+            t_id: str, statement: str, default_is_folder: bool, prop_qn: str | None
+        ) -> list[CmisSearchResult]:
             out: list[CmisSearchResult] = []
             skip = 0
             while len(out) < max_items_per_type:
@@ -662,27 +716,71 @@ class CmisClient:
                 rows = rows[: max_items_per_type - len(out)]
                 for row in rows:
                     props = row.get("properties", {}) or row.get("succinctProperties", {})
-                    value = _prop(props, prop_qn)
-                    if value is None:
-                        value = _prop(props, property_id)
+                    if prop_qn:
+                        value = _prop(props, prop_qn)
+                        if value is None:
+                            value = _prop(props, property_id)
+                    else:
+                        value = None
+                    base = _prop(props, "cmis:baseTypeId")
+                    is_folder = (
+                        base == "cmis:folder" if base else default_is_folder
+                    )
                     out.append(
                         CmisSearchResult(
                             object_id=_prop(props, "cmis:objectId") or "",
                             name=_prop(props, "cmis:name") or "",
                             object_type_id=_prop(props, "cmis:objectTypeId") or t_id,
                             property_value="" if value is None else str(value),
+                            is_folder=is_folder,
                         )
                     )
                 skip += len(rows)
                 if not payload.get("hasMoreItems", False):
                     break
+            return out
+
+        async def query_prop(t_id: str) -> tuple[str, str, list[CmisSearchResult]]:
+            type_qn, prop_qn = await self.resolve_query_names(
+                repository_id, t_id, property_id
+            )
+            typedef = await self.get_type_definition(repository_id, t_id)
+            default_is_folder = base_type_of(typedef) == "cmis:folder"
+            statement = (
+                f"SELECT cmis:objectId, cmis:name, cmis:objectTypeId, "
+                f"cmis:baseTypeId, {prop_qn} "
+                f"FROM {type_qn} "
+                f"WHERE {prop_qn} LIKE '%{escaped}%'"
+            )
+            out = await run_query(t_id, statement, default_is_folder, prop_qn)
             return type_qn, prop_qn, out
 
-        results = await asyncio.gather(*(query_one(t) for t in target_types))
+        async def query_desc(t_id: str) -> tuple[str, str, list[CmisSearchResult]]:
+            typedef = await self.get_type_definition(repository_id, t_id)
+            type_qn = typedef.get("queryName") or typedef.get("query_name")
+            if not type_qn:
+                raise CmisError(
+                    f"Type {t_id!r} has no queryName; cannot include in "
+                    f"description-path search."
+                )
+            default_is_folder = base_type_of(typedef) == "cmis:folder"
+            statement = (
+                f"SELECT cmis:objectId, cmis:name, cmis:objectTypeId, "
+                f"cmis:baseTypeId "
+                f"FROM {type_qn}"
+            )
+            out = await run_query(t_id, statement, default_is_folder, None)
+            return str(type_qn), "", out
+
+        tasks = [query_prop(t) for t in prop_only] + [
+            query_desc(t) for t in desc_path_types
+        ]
+        labels = list(prop_only) + list(desc_path_types)
+        results = await asyncio.gather(*tasks) if tasks else []
 
         hits: list[CmisSearchResult] = []
         queried: list[tuple[str, str]] = []
-        for t_id, (type_qn, _prop_qn, batch) in zip(target_types, results):
+        for t_id, (type_qn, _prop_qn, batch) in zip(labels, results):
             queried.append((t_id, type_qn))
             hits.extend(batch)
         return hits, queried
