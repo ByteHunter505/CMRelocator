@@ -8,6 +8,7 @@ from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.events import Click
 from textual.widgets import (
     Button,
     Checkbox,
@@ -417,6 +418,13 @@ class CMRelocatorApp(App):
             )
         status.update(f"[green]{summary}[/green]")
         self._log(f"[green]{summary}[/green]")
+        if rows:
+            self._log(
+                "[dim]All items start pre-selected (green [x]). Click a row "
+                "(or Space on the focused row) to deselect. Use the "
+                "'Select all' / 'Deselect all' buttons for bulk. "
+                "Migrate only moves rows currently marked [x].[/dim]"
+            )
         self._log(
             "[dim]Folders will be moved with their entire subtree (CMIS moveObject).[/dim]"
         )
@@ -458,6 +466,20 @@ class CMRelocatorApp(App):
         if event.row_key.value is None:
             return
         self._toggle_index(int(event.row_key.value))
+
+    @on(Click, "#docs")
+    def handle_click_on_docs(self, event: Click) -> None:
+        """A single click on the table toggles the row under the cursor.
+
+        Textual's DataTable only fires RowSelected on Enter or double-click;
+        a single click just moves the cursor. Without this handler the user
+        clicks rows and nothing visible happens. We defer to the next
+        refresh so DataTable has time to move its cursor to the clicked row
+        before we toggle.
+        """
+        if not self.rows:
+            return
+        self.call_after_refresh(self.action_toggle_row)
 
     @on(Button.Pressed, "#select_all")
     def handle_select_all(self) -> None:
@@ -682,8 +704,10 @@ class CMRelocatorApp(App):
             await self._client.close()
 
 
-def _checkbox(selected: bool) -> str:
-    return "[x]" if selected else "[ ]"
+def _checkbox(selected: bool) -> Text:
+    if selected:
+        return Text("[x]", style="bold green")
+    return Text("[ ]", style="dim")
 
 
 def _fmt_size(size: int | None) -> str:
