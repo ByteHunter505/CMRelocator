@@ -361,6 +361,12 @@ class CMRelocatorApp(App):
     @on(Button.Pressed, "#query")
     @work(exclusive=True)
     async def handle_query(self) -> None:
+        # Wipe any previous query's results before validating so that
+        # a failed/early-returning Query also clears stale rows.
+        self.rows = []
+        self.query_one("#docs", DataTable).clear()
+        self.query_one("#progress", ProgressBar).update(total=0, progress=0)
+
         if self._client is None:
             self._log("[red]Connect first.[/red]")
             return
