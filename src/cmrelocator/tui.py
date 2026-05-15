@@ -94,6 +94,7 @@ class CMRelocatorApp(App):
 
     /* The one row that holds a Select keeps its native 3-row height. */
     #source_kind_row { height: 3; }
+    #search_scope_row { height: 3; }
 
     #selected_type_row {
         height: 1;
@@ -255,11 +256,23 @@ class CMRelocatorApp(App):
             with TabPane("Search", id="tab_search"):
                 with VerticalScroll(id="search-form"):
                     with Vertical(id="search-panel"):
-                        yield Static("[b]Search folders by property and/or type description[/b]")
+                        yield Static("[b]Search by property and/or type description[/b]")
+                        with Horizontal(id="search_scope_row"):
+                            yield Label("Search scope", classes="field")
+                            yield Select(
+                                options=[
+                                    ("Folders", "folder"),
+                                    ("Documents", "document"),
+                                    ("Both", "both"),
+                                ],
+                                value="folder",
+                                allow_blank=False,
+                                id="search_scope",
+                            )
                         with Horizontal():
-                            yield Label("Folder type", classes="field")
+                            yield Label("Type ID", classes="field")
                             yield Input(
-                                placeholder="(optional - leave empty to auto-discover every folder type that has this property)",
+                                placeholder="(optional - leave empty to auto-discover every type in scope that has this property)",
                                 id="search_type",
                             )
                         with Horizontal():
@@ -820,6 +833,7 @@ class CMRelocatorApp(App):
         prop_id = self.query_one("#search_property", Input).value.strip()
         value = self.query_one("#search_value", Input).value.strip()
         desc = self.query_one("#search_desc", Input).value.strip()
+        scope = str(self.query_one("#search_scope", Select).value)
         if not prop_id:
             self._log("[red]Provide the property to search.[/red]")
             return
@@ -837,32 +851,64 @@ class CMRelocatorApp(App):
             hi=10_000,
         )
 
+        # An explicit Type ID pins the FROM clause -- "scope" is moot,
+        # and walking both trees with the same type_id would double-
+        # query it. Auto-discovery is the case where scope matters.
+        if type_id:
+            roots = ["cmis:folder"]  # ignored anyway; needed as a single iteration
+        elif scope == "both":
+            roots = ["cmis:folder", "cmis:document"]
+        elif scope == "document":
+            roots = ["cmis:document"]
+        else:
+            roots = ["cmis:folder"]
+
         status = self.query_one("#search_status", Static)
         status.update("[yellow]Searching...[/yellow]")
         clauses: list[str] = []
         if value:
-            scope = (
+            target = (
                 f"type={type_id}"
                 if type_id
                 else f"auto-discover types defining property={prop_id}"
             )
-            clauses.append(f"property LIKE '%{value}%' on {scope}")
+            clauses.append(f"property LIKE '%{value}%' on {target}")
         if desc:
             clauses.append(f"type description contains {desc!r}")
         self._log(
-            f"[cyan]Search ({' OR '.join(clauses)}):[/cyan] "
-            f"max {max_items} per type"
+            f"[cyan]Search[/cyan] scope={scope}, "
+            f"{' OR '.join(clauses)}, max {max_items} per type"
         )
 
         try:
-            hits, queried = await self._client.search_by_property(
-                self._repo_id,
-                prop_id,
-                value,
-                type_id=type_id,
-                description_contains=desc or None,
-                max_items_per_type=max_items,
+            # `find_*` failures are different per root (e.g. property
+            # exists under cmis:folder but not under cmis:document). With
+            # multiple roots we don't want one barren tree to abort the
+            # whole search, so swallow CmisError per root and keep going.
+            per_root = await asyncio.gather(
+                *(
+                    self._search_one_root(prop_id, value, type_id, desc, root, max_items)
+                    for root in roots
+                ),
+                return_exceptions=True,
             )
+            hits: list[CmisSearchResult] = []
+            queried: list[tuple[str, str]] = []
+            errors: list[str] = []
+            for root, result in zip(roots, per_root):
+                if isinstance(result, Exception):
+                    errors.append(f"{root}: {result}")
+                    continue
+                root_hits, root_queried = result
+                hits.extend(root_hits)
+                queried.extend(root_queried)
+            if errors and not hits:
+                status.update("[red]Search failed[/red]")
+                for err in errors:
+                    self._log(f"[red]Search failed: {err}[/red]")
+                return
+            for err in errors:
+                self._log(f"[yellow]Partial: {err}[/yellow]")
         except Exception as exc:
             status.update("[red]Search failed[/red]")
             self._log(f"[red]Search failed: {exc}[/red]")
@@ -938,6 +984,25 @@ class CMRelocatorApp(App):
         )
 
     # ===================== Helpers =====================
+
+    async def _search_one_root(
+        self,
+        prop_id: str,
+        value: str,
+        type_id: str | None,
+        desc: str,
+        root_type_id: str,
+        max_items: int,
+    ) -> tuple[list[CmisSearchResult], list[tuple[str, str]]]:
+        return await self._client.search_by_property(  # type: ignore[union-attr]
+            self._repo_id,
+            prop_id,
+            value,
+            type_id=type_id,
+            root_type_id=root_type_id,
+            description_contains=desc or None,
+            max_items_per_type=max_items,
+        )
 
     async def _create_missing_targets(
         self,
