@@ -237,7 +237,7 @@ function Find-RootFolder([hashtable]$qn, [string]$cif, [string]$label) {
         $rows = @(Get-Member-Value $r 'results')
         if ($rows.Count -eq 0) { continue }
         if ($rows.Count -gt 1) {
-            Write-WarnLine "$label: multiple folders for CIF $cif (using first; 1:1 assumption)."
+            Write-WarnLine "${label}: multiple folders for CIF $cif (using first; 1:1 assumption)."
         }
         $id   = Get-PropValue $rows[0] 'cmis:objectId'
         $name = Get-PropValue $rows[0] 'cmis:name'
