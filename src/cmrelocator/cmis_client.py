@@ -23,6 +23,7 @@ This client resolves queryNames automatically via getTypeDefinition.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -113,6 +114,10 @@ class CmisClient:
             follow_redirects=True,
         )
         self._repositories: dict[str, RepositoryInfo] = {}
+        # repo_id -> root_type_id -> flat list of typedef dicts.
+        # Populated lazily by get_type_descendants; type trees don't
+        # change during a session so a single fetch is plenty.
+        self._descendants_cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
 
     async def __aenter__(self) -> "CmisClient":
         return self
@@ -219,6 +224,115 @@ class CmisClient:
                 f"Property {property_id!r} on type {type_id!r} has no queryName."
             )
         return type_qn, prop_qn
+
+    async def get_type_descendants(
+        self,
+        repository_id: str,
+        *,
+        root_type_id: str = "cmis:folder",
+        depth: int = -1,
+        include_property_definitions: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Fetch and flatten the type tree rooted at `root_type_id`.
+
+        Returns each descendant as its full type-definition dict (including
+        `parentTypeId` and, when requested, `propertyDefinitions`). Does
+        NOT include the root itself in the result.
+
+        Cached per (repo, root_type_id) -- the type tree is fixed for the
+        lifetime of the session.
+        """
+        cache = self._descendants_cache.setdefault(repository_id, {})
+        if root_type_id in cache:
+            return cache[root_type_id]
+
+        repo = self.repository(repository_id)
+        params: dict[str, Any] = {
+            "cmisselector": "typeDescendants",
+            "typeId": root_type_id,
+            "depth": str(depth),
+            "includePropertyDefinitions": (
+                "true" if include_property_definitions else "false"
+            ),
+        }
+        resp = await self._client.get(repo.repository_url, params=params)
+        self._raise_for_status(resp)
+        tree = resp.json()
+
+        out: list[dict[str, Any]] = []
+
+        def walk(nodes: Any) -> None:
+            if not isinstance(nodes, list):
+                return
+            for n in nodes:
+                if not isinstance(n, dict):
+                    continue
+                t = n.get("type") or {}
+                if isinstance(t, dict) and t.get("id"):
+                    out.append(t)
+                walk(n.get("children"))
+
+        walk(tree)
+        cache[root_type_id] = out
+        return out
+
+    async def find_property_owning_types(
+        self,
+        repository_id: str,
+        property_id: str,
+        *,
+        root_type_id: str = "cmis:folder",
+    ) -> list[str]:
+        """Return the "frontier" of types under `root_type_id` that define
+        `property_id` -- i.e. the topmost types in the hierarchy where
+        the property appears.
+
+        CMIS SQL `SELECT FROM T` includes instances of T and all of T's
+        subtypes by default, so querying each frontier type is sufficient
+        to cover everything in the tree that has the property; no
+        deduplication is required because an object belongs to exactly
+        one concrete type.
+
+        A type T is in the frontier iff:
+          1. T's propertyDefinitions contain `property_id`, AND
+          2. T's parent type is either outside the walked tree (e.g.
+             cmis:folder itself), or does NOT have the property in
+             its propertyDefinitions.
+        """
+        descendants = await self.get_type_descendants(
+            repository_id,
+            root_type_id=root_type_id,
+            depth=-1,
+            include_property_definitions=True,
+        )
+        by_id: dict[str, dict[str, Any]] = {}
+        for t in descendants:
+            tid = t.get("id")
+            if isinstance(tid, str):
+                by_id[tid] = t
+
+        def has_prop(t: dict[str, Any] | None) -> bool:
+            if t is None:
+                return False
+            props = t.get("propertyDefinitions") or {}
+            if not isinstance(props, dict):
+                return False
+            if property_id in props:
+                return True
+            for pdef in props.values():
+                if isinstance(pdef, dict) and pdef.get("id") == property_id:
+                    return True
+            return False
+
+        frontier: list[str] = []
+        for tid, tdef in by_id.items():
+            if not has_prop(tdef):
+                continue
+            parent_id = tdef.get("parentTypeId") or tdef.get("parentId")
+            parent_def = by_id.get(parent_id) if isinstance(parent_id, str) else None
+            if not has_prop(parent_def):
+                frontier.append(tid)
+        return frontier
 
     async def list_documents_in_folder(
         self,
@@ -458,14 +572,15 @@ class CmisClient:
     async def search_by_property(
         self,
         repository_id: str,
-        type_id: str,
         property_id: str,
         value_substring: str,
         *,
-        max_items: int = 1000,
+        type_id: str | None = None,
+        root_type_id: str = "cmis:folder",
+        max_items_per_type: int = 1000,
         page_size: int = 500,
-    ) -> tuple[list[CmisSearchResult], str, str]:
-        """Substring search on a custom property of a specific ItemType.
+    ) -> tuple[list[CmisSearchResult], list[tuple[str, str]]]:
+        """Substring search on a custom property.
 
         Runs `SELECT ... FROM <type_qn> WHERE <prop_qn> LIKE '%VALUE%'`,
         resolving queryNames for both the type and the property. Match
@@ -475,64 +590,102 @@ class CmisClient:
         wildcards (% and _) inside the value are NOT escaped, so they
         act as wildcards.
 
-        Returns (hits, type_queryName, property_queryName). The latter
-        two are returned so the UI can display the exact SQL identifiers
-        that were used.
+        Two modes:
+
+        * `type_id` provided -> single query against that type.
+        * `type_id` is None  -> walk the `root_type_id` subtree, find
+          every "frontier" type that defines `property_id`, and run one
+          query per frontier in parallel. Each FROM <type> query covers
+          all descendants of that type by CMIS default semantics, so the
+          union of results is exhaustive for the subtree.
+
+        `max_items_per_type` caps each individual query, NOT the total.
+        With N frontier types you may get up to N * max_items_per_type
+        rows back.
+
+        Returns (hits, queried_types) where queried_types is a list of
+        (type_id, type_queryName) pairs so the UI can show what was
+        actually searched.
         """
         if not value_substring:
-            return [], "", ""
-        repo = self.repository(repository_id)
-        type_qn, prop_qn = await self.resolve_query_names(
-            repository_id, type_id, property_id
-        )
-        escaped = value_substring.replace("'", "''")
-        statement = (
-            f"SELECT cmis:objectId, cmis:name, cmis:objectTypeId, {prop_qn} "
-            f"FROM {type_qn} "
-            f"WHERE {prop_qn} LIKE '%{escaped}%'"
-        )
+            return [], []
 
-        out: list[CmisSearchResult] = []
-        skip = 0
-        while len(out) < max_items:
-            batch = min(page_size, max_items - len(out))
-            data = {
-                "cmisaction": "query",
-                "statement": statement,
-                "searchAllVersions": "false",
-                "maxItems": str(batch),
-                "skipCount": str(skip),
-            }
-            resp = await self._client.post(repo.repository_url, data=data)
-            if not resp.is_success:
+        target_types: list[str]
+        if type_id:
+            target_types = [type_id]
+        else:
+            target_types = await self.find_property_owning_types(
+                repository_id, property_id, root_type_id=root_type_id
+            )
+            if not target_types:
                 raise CmisError(
-                    f"HTTP {resp.status_code} for search statement "
-                    f"{statement!r}: {resp.text[:500]}",
-                    status_code=resp.status_code,
-                    body=resp.text,
+                    f"No type under {root_type_id!r} defines property "
+                    f"{property_id!r} in this repository. Try a different "
+                    f"property id or pass an explicit Folder type."
                 )
-            payload = resp.json()
-            rows = payload.get("results", []) or []
-            if not rows:
-                break
-            rows = rows[: max_items - len(out)]
-            for row in rows:
-                props = row.get("properties", {}) or row.get("succinctProperties", {})
-                value = _prop(props, prop_qn)
-                if value is None:
-                    value = _prop(props, property_id)
-                out.append(
-                    CmisSearchResult(
-                        object_id=_prop(props, "cmis:objectId") or "",
-                        name=_prop(props, "cmis:name") or "",
-                        object_type_id=_prop(props, "cmis:objectTypeId") or type_id,
-                        property_value="" if value is None else str(value),
+
+        escaped = value_substring.replace("'", "''")
+        repo = self.repository(repository_id)
+
+        async def query_one(t_id: str) -> tuple[str, str, list[CmisSearchResult]]:
+            type_qn, prop_qn = await self.resolve_query_names(
+                repository_id, t_id, property_id
+            )
+            statement = (
+                f"SELECT cmis:objectId, cmis:name, cmis:objectTypeId, {prop_qn} "
+                f"FROM {type_qn} "
+                f"WHERE {prop_qn} LIKE '%{escaped}%'"
+            )
+            out: list[CmisSearchResult] = []
+            skip = 0
+            while len(out) < max_items_per_type:
+                batch = min(page_size, max_items_per_type - len(out))
+                data = {
+                    "cmisaction": "query",
+                    "statement": statement,
+                    "searchAllVersions": "false",
+                    "maxItems": str(batch),
+                    "skipCount": str(skip),
+                }
+                resp = await self._client.post(repo.repository_url, data=data)
+                if not resp.is_success:
+                    raise CmisError(
+                        f"HTTP {resp.status_code} for search statement "
+                        f"{statement!r}: {resp.text[:500]}",
+                        status_code=resp.status_code,
+                        body=resp.text,
                     )
-                )
-            skip += len(rows)
-            if not payload.get("hasMoreItems", False):
-                break
-        return out, type_qn, prop_qn
+                payload = resp.json()
+                rows = payload.get("results", []) or []
+                if not rows:
+                    break
+                rows = rows[: max_items_per_type - len(out)]
+                for row in rows:
+                    props = row.get("properties", {}) or row.get("succinctProperties", {})
+                    value = _prop(props, prop_qn)
+                    if value is None:
+                        value = _prop(props, property_id)
+                    out.append(
+                        CmisSearchResult(
+                            object_id=_prop(props, "cmis:objectId") or "",
+                            name=_prop(props, "cmis:name") or "",
+                            object_type_id=_prop(props, "cmis:objectTypeId") or t_id,
+                            property_value="" if value is None else str(value),
+                        )
+                    )
+                skip += len(rows)
+                if not payload.get("hasMoreItems", False):
+                    break
+            return type_qn, prop_qn, out
+
+        results = await asyncio.gather(*(query_one(t) for t in target_types))
+
+        hits: list[CmisSearchResult] = []
+        queried: list[tuple[str, str]] = []
+        for t_id, (type_qn, _prop_qn, batch) in zip(target_types, results):
+            queried.append((t_id, type_qn))
+            hits.extend(batch)
+        return hits, queried
 
     async def move_object(
         self,

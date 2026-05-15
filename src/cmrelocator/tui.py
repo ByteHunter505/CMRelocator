@@ -249,7 +249,7 @@ class CMRelocatorApp(App):
                         with Horizontal():
                             yield Label("Folder type", classes="field")
                             yield Input(
-                                placeholder="$p!-2_BAC_01_01_01_02v-1",
+                                placeholder="(optional - leave empty to auto-discover every folder type that has this property)",
                                 id="search_type",
                             )
                         with Horizontal():
@@ -780,15 +780,17 @@ class CMRelocatorApp(App):
     @on(Button.Pressed, "#search_btn")
     @work(exclusive=True)
     async def handle_search(self) -> None:
+        # Wipe any previous search results before validating so a failed
+        # / early-returning Search also clears stale rows.
+        self.search_hits = []
+        self.query_one("#search_results", DataTable).clear()
+
         if self._client is None:
             self._log("[red]Connect first.[/red]")
             return
-        type_id = self.query_one("#search_type", Input).value.strip()
+        type_id = self.query_one("#search_type", Input).value.strip() or None
         prop_id = self.query_one("#search_property", Input).value.strip()
         value = self.query_one("#search_value", Input).value.strip()
-        if not type_id:
-            self._log("[red]Provide the Folder Type ID to search in.[/red]")
-            return
         if not prop_id:
             self._log("[red]Provide the property to search.[/red]")
             return
@@ -804,27 +806,34 @@ class CMRelocatorApp(App):
 
         status = self.query_one("#search_status", Static)
         status.update("[yellow]Searching (LIKE, case-sensitive)...[/yellow]")
-        self._log(
-            f"[cyan]Search:[/cyan] type={type_id}  property={prop_id}  "
-            f"value LIKE '%{value}%'  (max {max_items})"
-        )
+        if type_id:
+            self._log(
+                f"[cyan]Search:[/cyan] type={type_id}  property={prop_id}  "
+                f"value LIKE '%{value}%'  (max {max_items})"
+            )
+        else:
+            self._log(
+                f"[cyan]Search:[/cyan] auto-discovering folder types with "
+                f"property={prop_id}, then querying value LIKE '%{value}%' "
+                f"(max {max_items} per type)..."
+            )
 
         try:
-            hits, type_qn, prop_qn = await self._client.search_by_property(
+            hits, queried = await self._client.search_by_property(
                 self._repo_id,
-                type_id,
                 prop_id,
                 value,
-                max_items=max_items,
+                type_id=type_id,
+                max_items_per_type=max_items,
             )
         except Exception as exc:
             status.update("[red]Search failed[/red]")
             self._log(f"[red]Search failed: {exc}[/red]")
             return
 
-        self._log(
-            f"[dim]Resolved queryNames -> type={type_qn}  property={prop_qn}[/dim]"
-        )
+        if queried:
+            summary = ", ".join(f"{t}->{qn}" for t, qn in queried)
+            self._log(f"[dim]Queried {len(queried)} type(s): {summary}[/dim]")
         hits.sort(key=lambda h: h.property_value.lower())
         self.search_hits = hits
 
