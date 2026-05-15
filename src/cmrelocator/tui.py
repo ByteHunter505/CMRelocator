@@ -10,6 +10,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import (
     Button,
+    Checkbox,
     DataTable,
     Footer,
     Header,
@@ -20,7 +21,7 @@ from textual.widgets import (
     Static,
 )
 
-from cmrelocator.cmis_client import CmisChild, CmisClient, CmisError
+from cmrelocator.cmis_client import CmisChild, CmisClient, CmisError, CmisFolder
 
 
 @dataclass
@@ -43,7 +44,12 @@ class CMRelocatorApp(App):
 
     #top-form {
         height: auto;
-        max-height: 22;
+        max-height: 26;
+    }
+
+    .checkrow {
+        height: 1;
+        margin: 0 0 0 1;
     }
 
     #connection, #matching {
@@ -128,6 +134,9 @@ class CMRelocatorApp(App):
                     yield Label("Target Type ID", classes="field")
                     yield Input(placeholder="$p!-2_BAC_01_01_01_02v-2", id="target_type")
                 with Horizontal():
+                    yield Label("CIF property", classes="field")
+                    yield Input(value="clbNonGroup.BAC_CIF", id="cif_property")
+                with Horizontal():
                     yield Label("CIF (optional)", classes="field")
                     yield Input(placeholder="empty = migrate all customers", id="cif")
                 with Horizontal():
@@ -136,6 +145,16 @@ class CMRelocatorApp(App):
                 with Horizontal():
                     yield Label("Max parallel", classes="field")
                     yield Input(value="4", id="concurrency", restrict=r"[0-9]*")
+                yield Checkbox(
+                    "Create target folder if it doesn't exist",
+                    id="opt_create_target",
+                    classes="checkrow",
+                )
+                yield Checkbox(
+                    "Delete empty source folder after migration",
+                    id="opt_delete_source",
+                    classes="checkrow",
+                )
                 with Horizontal():
                     yield Button("Query items", id="query", variant="primary")
                     yield Static("", id="query_status")
@@ -212,11 +231,16 @@ class CMRelocatorApp(App):
 
         source_type = self.query_one("#source_type", Input).value.strip()
         target_type = self.query_one("#target_type", Input).value.strip()
+        cif_property = (
+            self.query_one("#cif_property", Input).value.strip()
+            or "clbNonGroup.BAC_CIF"
+        )
         cif = self.query_one("#cif", Input).value.strip()
         max_docs = _safe_int(self.query_one("#max_docs", Input).value, default=5000, lo=1)
         concurrency = _safe_int(
             self.query_one("#concurrency", Input).value, default=4, lo=1, hi=16
         )
+        opt_create_target = self.query_one("#opt_create_target", Checkbox).value
 
         if not source_type or not target_type:
             self._log("[red]Provide source and target Type IDs.[/red]")
@@ -227,10 +251,10 @@ class CMRelocatorApp(App):
 
         try:
             source_folders, src_hit_cap = await self._client.list_folders_by_type(
-                self._repo_id, source_type, cif=cif or None
+                self._repo_id, source_type, cif=cif or None, cif_property=cif_property
             )
             target_folders, tgt_hit_cap = await self._client.list_folders_by_type(
-                self._repo_id, target_type, cif=cif or None
+                self._repo_id, target_type, cif=cif or None, cif_property=cif_property
             )
         except Exception as exc:
             status.update("[red]Folder query failed[/red]")
@@ -251,7 +275,7 @@ class CMRelocatorApp(App):
                if tgt_hit_cap else "")
         )
 
-        target_by_cif: dict[str, str] = {}
+        target_by_cif: dict[str, CmisFolder] = {}
         target_dupes = 0
         for tf in target_folders:
             if not tf.cif:
@@ -259,9 +283,9 @@ class CMRelocatorApp(App):
             if tf.cif in target_by_cif:
                 target_dupes += 1
                 continue
-            target_by_cif[tf.cif] = tf.object_id
+            target_by_cif[tf.cif] = tf
 
-        source_by_cif: dict[str, str] = {}
+        source_by_cif: dict[str, CmisFolder] = {}
         source_dupes = 0
         source_no_cif = 0
         for sf in source_folders:
@@ -271,7 +295,7 @@ class CMRelocatorApp(App):
             if sf.cif in source_by_cif:
                 source_dupes += 1
                 continue
-            source_by_cif[sf.cif] = sf.object_id
+            source_by_cif[sf.cif] = sf
 
         cifs_src = set(source_by_cif.keys())
         cifs_tgt = set(target_by_cif.keys())
@@ -279,18 +303,42 @@ class CMRelocatorApp(App):
         only_source = cifs_src - cifs_tgt
         only_target = cifs_tgt - cifs_src
 
-        pairs: list[tuple[str, str, str]] = [
-            (c, source_by_cif[c], target_by_cif[c]) for c in sorted(matched_cifs)
-        ]
-
         self._log(
             f"[cyan]Matching:[/cyan] {len(matched_cifs)} pairs ready  |  "
-            f"orphans: {len(only_source)} src-only (skipped), "
+            f"orphans: {len(only_source)} src-only, "
             f"{len(only_target)} tgt-only (skipped)  |  "
             f"dupes ignored: {source_dupes} src, {target_dupes} tgt"
             + (f"  |  {source_no_cif} src folders without CIF (skipped)"
                if source_no_cif else "")
         )
+
+        # Optional: create target folders for src-only orphans.
+        if opt_create_target and only_source:
+            created, failed = await self._create_missing_targets(
+                only_source=only_source,
+                source_by_cif=source_by_cif,
+                target_by_cif=target_by_cif,
+                target_type=target_type,
+                cif_property=cif_property,
+            )
+            if created:
+                # Recompute matched / only_source based on newly created targets.
+                cifs_tgt = set(target_by_cif.keys())
+                matched_cifs = cifs_src & cifs_tgt
+                only_source = cifs_src - cifs_tgt
+                self._log(
+                    f"[green]Created {created} target folder(s)[/green]"
+                    + (f", [red]{failed} failed[/red]" if failed else "")
+                    + f" -> {len(matched_cifs)} pairs ready, "
+                    f"{len(only_source)} src-only remain."
+                )
+            elif failed:
+                self._log(f"[red]Target creation: 0 created, {failed} failed.[/red]")
+
+        pairs: list[tuple[str, str, str]] = [
+            (c, source_by_cif[c].object_id, target_by_cif[c].object_id)
+            for c in sorted(matched_cifs)
+        ]
 
         if not pairs:
             status.update("[red]No matching source/target pairs[/red]")
@@ -506,6 +554,120 @@ class CMRelocatorApp(App):
         self._log(
             f"[bold]Done.[/bold] ok={counters['ok']}  fail={counters['fail']}  "
             f"total={len(targets)}"
+        )
+
+        # Optional cleanup: delete source folders that ended up empty.
+        if self.query_one("#opt_delete_source", Checkbox).value:
+            await self._cleanup_empty_sources(targets)
+
+    async def _create_missing_targets(
+        self,
+        *,
+        only_source: set[str],
+        source_by_cif: dict[str, CmisFolder],
+        target_by_cif: dict[str, CmisFolder],
+        target_type: str,
+        cif_property: str,
+    ) -> tuple[int, int]:
+        """Create target folders for CIFs that exist only in source.
+
+        Mutates `target_by_cif` to include the newly created folders.
+        Returns (created_count, failed_count).
+        """
+        if not only_source:
+            return 0, 0
+        if not target_by_cif:
+            self._log(
+                "[yellow]Create-target enabled but no existing target folder to "
+                "derive the parent from. Manually create one target folder of "
+                "the right type first, then re-run.[/yellow]"
+            )
+            return 0, 0
+
+        sample = next(iter(target_by_cif.values()))
+        try:
+            parents = await self._client.get_object_parents(  # type: ignore[union-attr]
+                self._repo_id, sample.object_id
+            )
+        except Exception as exc:
+            self._log(f"[red]Could not fetch parent of an existing target: {exc}[/red]")
+            return 0, 0
+        if not parents:
+            self._log(
+                "[yellow]Existing target folder has no discoverable parent; "
+                "cannot create new targets.[/yellow]"
+            )
+            return 0, 0
+        parent_id = parents[0]
+        self._log(
+            f"[cyan]Creating {len(only_source)} target folder(s) under "
+            f"parent {parent_id}...[/cyan]"
+        )
+
+        created = 0
+        failed = 0
+        for cif_v in sorted(only_source):
+            sf = source_by_cif[cif_v]
+            try:
+                new_id = await self._client.create_folder(  # type: ignore[union-attr]
+                    self._repo_id,
+                    parent_id,
+                    sf.name,
+                    target_type,
+                    custom_properties={cif_property: cif_v},
+                )
+                target_by_cif[cif_v] = CmisFolder(
+                    object_id=new_id,
+                    name=sf.name,
+                    cif=cif_v,
+                    object_type_id=target_type,
+                )
+                created += 1
+            except Exception as exc:
+                failed += 1
+                self._log(
+                    f"[red]Create target for CIF {cif_v} failed: {exc}[/red]"
+                )
+        return created, failed
+
+    async def _cleanup_empty_sources(
+        self, migrated_rows: list[tuple[int, ItemRow]]
+    ) -> None:
+        """For each source folder touched during this migration, delete it
+        if it's now empty. Sources that still hold content (because some
+        moves failed or because items weren't selected) are left alone.
+        """
+        touched = {row.source_folder_id for _, row in migrated_rows}
+        if not touched:
+            return
+        self._log(
+            f"[cyan]Cleanup:[/cyan] checking {len(touched)} source folder(s) "
+            f"for emptiness..."
+        )
+        deleted = 0
+        not_empty = 0
+        errored = 0
+        for src_id in touched:
+            try:
+                remaining = await self._client.list_children(  # type: ignore[union-attr]
+                    self._repo_id, src_id, max_items=1
+                )
+                if remaining:
+                    not_empty += 1
+                    continue
+                await self._client.delete_object(  # type: ignore[union-attr]
+                    self._repo_id, src_id
+                )
+                deleted += 1
+                self._log(f"[green]Deleted empty source[/green] {src_id}")
+            except Exception as exc:
+                errored += 1
+                self._log(
+                    f"[red]Cleanup failed for {src_id}: {exc}[/red]"
+                )
+        self._log(
+            f"[bold]Cleanup done.[/bold] deleted={deleted}  "
+            f"still_had_content={not_empty}  errored={errored}"
         )
 
     async def on_unmount(self) -> None:

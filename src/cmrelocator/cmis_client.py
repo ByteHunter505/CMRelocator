@@ -6,11 +6,14 @@ CMIS-compliant repository exposing the Browser Binding (JSON).
 Only the operations needed by CMRelocator are implemented:
 - fetch_repositories     -> service document
 - get_folder             -> object properties of a folder
+- get_object_parents     -> parent folders of any object
 - get_type_definition    -> full type definition (id, queryName, properties)
 - list_documents_in_folder
 - list_folders_by_type   -> folders of a custom ItemType filtered by CIF
 - list_children          -> direct children (folders + docs) of a folder
+- create_folder          -> CMIS createFolder
 - move_object            -> CMIS moveObject (cmisaction=move)
+- delete_object          -> CMIS deleteObject (cmisaction=delete)
 
 CMIS SQL note: The OASIS CMIS 1.1 grammar does not allow quoted identifiers.
 Type and property references in queries must be the `queryName`, not the `id`.
@@ -141,6 +144,30 @@ class CmisClient:
         self._raise_for_status(resp)
         return resp.json()
 
+    async def get_object_parents(
+        self, repository_id: str, object_id: str
+    ) -> list[str]:
+        """Return objectIds of the parent folders of an object.
+
+        Folders are typically single-parented; documents may be multi-filed.
+        """
+        repo = self.repository(repository_id)
+        params = {"cmisselector": "parents", "objectId": object_id, "succinct": "true"}
+        resp = await self._client.get(repo.root_folder_url, params=params)
+        self._raise_for_status(resp)
+        payload = resp.json()
+        entries = payload if isinstance(payload, list) else payload.get("objects", []) or []
+        parents: list[str] = []
+        for entry in entries:
+            obj = entry.get("object", entry) if isinstance(entry, dict) else entry
+            if not isinstance(obj, dict):
+                continue
+            props = obj.get("properties", {}) or obj.get("succinctProperties", {})
+            pid = _prop(props, "cmis:objectId")
+            if pid:
+                parents.append(str(pid))
+        return parents
+
     async def get_type_definition(
         self, repository_id: str, type_id: str
     ) -> dict[str, Any]:
@@ -228,7 +255,7 @@ class CmisClient:
         type_id: str,
         *,
         cif: str | None = None,
-        cif_property: str = "clbNonGroup-BAC_CIF",
+        cif_property: str = "clbNonGroup.BAC_CIF",
         max_items: int = 50_000,
         page_size: int = 500,
     ) -> tuple[list[CmisFolder], bool]:
@@ -366,6 +393,64 @@ class CmisClient:
             return resp.json()
         except ValueError:
             return {}
+
+    async def create_folder(
+        self,
+        repository_id: str,
+        parent_folder_id: str,
+        name: str,
+        type_id: str,
+        *,
+        custom_properties: dict[str, Any] | None = None,
+    ) -> str:
+        """Create a folder under `parent_folder_id` and return its new objectId.
+
+        Sets cmis:name, cmis:objectTypeId, plus any custom_properties (mapping
+        of property id -> value). If the type has additional required
+        properties not provided here, the server will reject the request.
+        """
+        repo = self.repository(repository_id)
+        data: dict[str, Any] = {
+            "cmisaction": "createFolder",
+            "objectId": parent_folder_id,
+            "propertyId[0]": "cmis:name",
+            "propertyValue[0]": name,
+            "propertyId[1]": "cmis:objectTypeId",
+            "propertyValue[1]": type_id,
+        }
+        idx = 2
+        for key, value in (custom_properties or {}).items():
+            data[f"propertyId[{idx}]"] = key
+            data[f"propertyValue[{idx}]"] = "" if value is None else str(value)
+            idx += 1
+        resp = await self._client.post(repo.root_folder_url, data=data)
+        self._raise_for_status(resp)
+        if not resp.content:
+            raise CmisError("createFolder returned an empty body; no objectId.")
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise CmisError(f"createFolder returned non-JSON body: {exc}") from exc
+        props = payload.get("properties", {}) or payload.get("succinctProperties", {})
+        new_id = _prop(props, "cmis:objectId")
+        if not new_id:
+            raise CmisError("createFolder succeeded but no cmis:objectId in response.")
+        return str(new_id)
+
+    async def delete_object(
+        self, repository_id: str, object_id: str
+    ) -> None:
+        """CMIS deleteObject. For folders the server will refuse if it is
+        non-empty (no recursive descent). Use this only on folders you have
+        already confirmed are empty.
+        """
+        repo = self.repository(repository_id)
+        data = {
+            "cmisaction": "delete",
+            "objectId": object_id,
+        }
+        resp = await self._client.post(repo.root_folder_url, data=data)
+        self._raise_for_status(resp)
 
     @staticmethod
     def _raise_for_status(resp: httpx.Response) -> None:
