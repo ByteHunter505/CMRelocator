@@ -41,6 +41,11 @@ class CMRelocatorApp(App):
     CSS = """
     Screen { layout: vertical; }
 
+    #top-form {
+        height: auto;
+        max-height: 22;
+    }
+
     #connection, #matching {
         height: auto;
         border: round $accent;
@@ -56,16 +61,17 @@ class CMRelocatorApp(App):
 
     #docs {
         height: 1fr;
+        min-height: 10;
         margin: 0 1;
+        border: round $accent;
     }
 
-    #status {
-        height: auto;
+    #progress {
         margin: 0 1;
     }
 
     #log {
-        height: 12;
+        height: 10;
         border: round $accent;
         margin: 0 1 1 1;
     }
@@ -94,7 +100,7 @@ class CMRelocatorApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        with VerticalScroll():
+        with VerticalScroll(id="top-form"):
             with Vertical(id="connection"):
                 yield Static("[b]Connection[/b]")
                 with Horizontal():
@@ -134,18 +140,16 @@ class CMRelocatorApp(App):
                     yield Button("Query items", id="query", variant="primary")
                     yield Static("", id="query_status")
 
-            yield DataTable(id="docs", zebra_stripes=True, cursor_type="row")
+        yield DataTable(id="docs", zebra_stripes=True, cursor_type="row")
 
-            with Horizontal(id="actions"):
-                yield Button("Select all", id="select_all")
-                yield Button("Deselect all", id="deselect_all")
-                yield Button("Toggle row", id="toggle")
-                yield Button("Migrate", id="migrate", variant="success")
+        with Horizontal(id="actions"):
+            yield Button("Select all", id="select_all")
+            yield Button("Deselect all", id="deselect_all")
+            yield Button("Toggle row", id="toggle")
+            yield Button("Migrate", id="migrate", variant="success")
 
-            with Vertical(id="status"):
-                yield ProgressBar(id="progress", show_eta=True)
-
-            yield RichLog(id="log", highlight=True, markup=True, wrap=True)
+        yield ProgressBar(id="progress", show_eta=True)
+        yield RichLog(id="log", highlight=True, markup=True, wrap=True)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -357,7 +361,7 @@ class CMRelocatorApp(App):
                 row.item.name,
                 _fmt_size(row.item.content_stream_length) if not row.item.is_folder else "",
                 row.item.content_stream_mime_type or "",
-                (row.item.last_modified or "")[:19],
+                _fmt_modified(row.item.last_modified),
                 _status_text(row.status, row.error),
                 key=str(idx),
             )
@@ -432,13 +436,13 @@ class CMRelocatorApp(App):
             if row.selected and row.status != "done"
         ]
         if not targets:
-            self._log("[yellow]No items selected (or all already moved).[/yellow]")
+            self._log("[yellow]No documents selected (or all already moved).[/yellow]")
             return
 
         progress = self.query_one("#progress", ProgressBar)
         progress.update(total=len(targets), progress=0)
         self._log(
-            f"[cyan]Migrating {len(targets)} items "
+            f"[cyan]Migrating {len(targets)} documents "
             f"(concurrency={concurrency})...[/cyan]"
         )
 
@@ -505,6 +509,26 @@ def _fmt_size(size: int | None) -> str:
     if size < 1024 ** 3:
         return f"{size / 1024 ** 2:.1f} MB"
     return f"{size / 1024 ** 3:.1f} GB"
+
+
+def _fmt_modified(value) -> str:
+    """Format a CMIS lastModificationDate, which can arrive as Unix
+    milliseconds (int/float) or as an ISO 8601 string depending on the
+    CMIS server. Returns an empty string for None / empty / unparseable."""
+    if value is None or value == "":
+        return ""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        from datetime import datetime, timezone
+        try:
+            seconds = float(value) / 1000.0
+            return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except (OverflowError, OSError, ValueError):
+            return str(value)
+    return str(value)[:19]
 
 
 def _status_text(status: str, error: str) -> Text:
