@@ -54,7 +54,7 @@ class CMRelocatorApp(App):
 
     #conn-area {
         height: auto;
-        max-height: 12;
+        max-height: 10;
     }
 
     #connection, #matching, #search-panel {
@@ -66,11 +66,24 @@ class CMRelocatorApp(App):
 
     #migrate-form, #search-form {
         height: auto;
-        max-height: 20;
+        max-height: 22;
     }
 
+    /* Flatten input-style widgets to a single row each so that field
+       rows do not vertically overflow into the next row. Textual's
+       defaults give Input/Select/Checkbox a `border: tall transparent`
+       that consumes 2 extra rows; we don't need it. */
+    Input, Select {
+        width: 1fr;
+        height: 1;
+        border: none;
+        padding: 0 1;
+    }
     Checkbox {
         margin: 0 1;
+        height: 1;
+        border: none;
+        padding: 0 1;
         background: transparent;
     }
 
@@ -102,8 +115,6 @@ class CMRelocatorApp(App):
         content-align: left middle;
     }
 
-    Input { width: 1fr; }
-    Select { width: 1fr; }
     Button { margin: 0 1 0 0; }
 
     .hidden { display: none; }
