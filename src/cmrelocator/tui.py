@@ -195,7 +195,7 @@ class CMRelocatorApp(App):
                         with Horizontal():
                             yield Label("Source Type ID", classes="field")
                             yield Input(
-                                placeholder="$p!-2_BAC_01_01_01_02v-1",
+                                placeholder="folder mode: required.  file mode: optional - leave empty to find docs globally by their CIF property",
                                 id="source_type",
                             )
                         with Horizontal():
@@ -427,12 +427,34 @@ class CMRelocatorApp(App):
         )
         opt_create_target = self.query_one("#opt_create_target", Checkbox).value
 
-        if not source_type or not target_type:
-            self._log("[red]Provide source and target Type IDs.[/red]")
+        if not target_type:
+            self._log("[red]Provide a Target Type ID.[/red]")
+            return
+        if source_kind == "folder" and not source_type:
+            self._log(
+                "[red]Folder mode: Source Type ID is required.[/red]"
+            )
             return
         if source_kind == "file" and not doc_type:
             self._log(
                 "[red]File mode: provide a Document Type ID to filter source items.[/red]"
+            )
+            return
+
+        # File mode + no Source Type: docs are discovered globally by
+        # their own CIF property, parents are looked up afterwards,
+        # and rows are routed to target folders by CIF. Different
+        # enough from the source-folder-driven flow that we branch
+        # out into a dedicated helper.
+        if source_kind == "file" and not source_type:
+            await self._query_file_by_doc_cif(
+                doc_type=doc_type,
+                target_type=target_type,
+                cif=cif,
+                cif_property=cif_property,
+                max_docs=max_docs,
+                concurrency=concurrency,
+                opt_create_target=opt_create_target,
             )
             return
 
@@ -1002,6 +1024,248 @@ class CMRelocatorApp(App):
             root_type_id=root_type_id,
             description_contains=desc or None,
             max_items_per_type=max_items,
+        )
+
+    async def _query_file_by_doc_cif(
+        self,
+        *,
+        doc_type: str,
+        target_type: str,
+        cif: str,
+        cif_property: str,
+        max_docs: int,
+        concurrency: int,
+        opt_create_target: bool,
+    ) -> None:
+        """File-mode discovery without a Source Type.
+
+        Queries documents of `doc_type` filtered by their own CIF
+        property, looks up the per-CIF target folder of `target_type`,
+        and resolves each document's parent folder to satisfy
+        moveObject's sourceFolderId requirement.
+        """
+        status = self.query_one("#query_status", Static)
+        status.update(
+            "[yellow]Discovering documents directly by CIF (paginated)...[/yellow]"
+        )
+
+        try:
+            doc_pairs, doc_hit_cap = await self._client.list_documents_of_type_by_cif(  # type: ignore[union-attr]
+                self._repo_id,
+                doc_type,
+                cif=cif or None,
+                cif_property=cif_property,
+            )
+            target_folders, tgt_hit_cap = await self._client.list_folders_by_type(  # type: ignore[union-attr]
+                self._repo_id,
+                target_type,
+                cif=cif or None,
+                cif_property=cif_property,
+            )
+        except Exception as exc:
+            status.update("[red]Discovery failed[/red]")
+            self._log(f"[red]Discovery failed: {exc}[/red]")
+            return
+
+        if not doc_pairs:
+            status.update("[red]No documents found[/red]")
+            self._log(
+                "[red]No documents of that type matched. Check the "
+                "Document Type ID and the CIF property name.[/red]"
+            )
+            return
+
+        self._log(
+            f"[cyan]Discovery (FILE-by-doc-CIF):[/cyan] "
+            f"{len(doc_pairs)} document(s), {len(target_folders)} target folder(s)"
+            + (
+                " [yellow](doc fetch hit cap of 50000)[/yellow]"
+                if doc_hit_cap
+                else ""
+            )
+            + (
+                " [yellow](target fetch hit cap of 50000)[/yellow]"
+                if tgt_hit_cap
+                else ""
+            )
+        )
+
+        target_by_cif: dict[str, CmisFolder] = {}
+        target_dupes = 0
+        for tf in target_folders:
+            if not tf.cif:
+                continue
+            if tf.cif in target_by_cif:
+                target_dupes += 1
+                continue
+            target_by_cif[tf.cif] = tf
+
+        # Group docs by CIF for the orphan-target creation step and
+        # for cleaner logging. Docs without a CIF can't be routed.
+        docs_by_cif: dict[str, list[CmisChild]] = {}
+        docs_no_cif = 0
+        for child, doc_cif in doc_pairs:
+            if not doc_cif:
+                docs_no_cif += 1
+                continue
+            docs_by_cif.setdefault(doc_cif, []).append(child)
+
+        cifs_with_docs = set(docs_by_cif.keys())
+        cifs_tgt = set(target_by_cif.keys())
+        routable_cifs = cifs_with_docs & cifs_tgt
+        only_doc_cifs = cifs_with_docs - cifs_tgt
+
+        # Optional: synthesise target folders for CIFs that have docs
+        # but no existing target. Mirrors the folder-mode flow but
+        # reuses any existing target folder as a parent-lookup probe.
+        if opt_create_target and only_doc_cifs and target_by_cif:
+            # The helper expects source_by_cif, so synthesise minimal
+            # CmisFolder stubs with just the CIF and the doc's name --
+            # the helper only reads `name` and `cif`.
+            source_stubs: dict[str, CmisFolder] = {}
+            for cif_v in only_doc_cifs:
+                first_doc = docs_by_cif[cif_v][0]
+                source_stubs[cif_v] = CmisFolder(
+                    object_id="",
+                    name=first_doc.name or cif_v,
+                    cif=cif_v,
+                    object_type_id="",
+                )
+            created, failed = await self._create_missing_targets(
+                only_source=set(only_doc_cifs),
+                source_by_cif=source_stubs,
+                target_by_cif=target_by_cif,
+                target_type=target_type,
+                cif_property=cif_property,
+            )
+            if created:
+                cifs_tgt = set(target_by_cif.keys())
+                routable_cifs = cifs_with_docs & cifs_tgt
+                only_doc_cifs = cifs_with_docs - cifs_tgt
+                self._log(
+                    f"[green]Created {created} target folder(s)[/green]"
+                    + (f", [red]{failed} failed[/red]" if failed else "")
+                    + f" -> {len(routable_cifs)} CIF(s) now routable."
+                )
+            elif failed:
+                self._log(
+                    f"[red]Target creation: 0 created, {failed} failed.[/red]"
+                )
+
+        routable_docs: list[tuple[str, CmisChild]] = []
+        unrouted_docs = 0
+        for cif_v, docs in docs_by_cif.items():
+            if cif_v not in target_by_cif:
+                unrouted_docs += len(docs)
+                continue
+            for d in docs:
+                routable_docs.append((cif_v, d))
+
+        self._log(
+            f"[cyan]Routing:[/cyan] "
+            f"{len(routable_docs)} doc(s) into {len(routable_cifs)} CIF(s)  |  "
+            f"unrouted: {unrouted_docs} (no target folder for the CIF)"
+            + (
+                f"  |  {docs_no_cif} doc(s) without a CIF (skipped)"
+                if docs_no_cif
+                else ""
+            )
+            + (
+                f"  |  {target_dupes} dup target(s) ignored"
+                if target_dupes
+                else ""
+            )
+        )
+
+        if not routable_docs:
+            status.update("[red]Nothing to migrate[/red]")
+            self._log(
+                "[red]No document has a matching target folder. Either "
+                "create the target folders or enable "
+                "'Create target folder if it doesn't exist'.[/red]"
+            )
+            return
+
+        status.update(
+            f"[yellow]Resolving parent folders for {len(routable_docs)} doc(s)...[/yellow]"
+        )
+
+        sem = asyncio.Semaphore(concurrency)
+
+        async def resolve_parent(
+            cif_v: str, doc: CmisChild
+        ) -> tuple[str, CmisChild, str | None]:
+            async with sem:
+                try:
+                    parents = await self._client.get_object_parents(  # type: ignore[union-attr]
+                        self._repo_id, doc.object_id
+                    )
+                except Exception as exc:
+                    self._log(
+                        f"[red]Parent lookup failed for {doc.object_id} "
+                        f"(CIF {cif_v}, {doc.name}): {exc}[/red]"
+                    )
+                    return cif_v, doc, None
+                # Document may be multi-filed; CMIS moveObject removes
+                # the link from one parent at a time. First parent is a
+                # reasonable default for the single-parent common case.
+                return cif_v, doc, parents[0] if parents else None
+
+        resolved = await asyncio.gather(
+            *(resolve_parent(c, d) for c, d in routable_docs)
+        )
+
+        rows: list[ItemRow] = []
+        no_parent = 0
+        multi_parent_warn = 0
+        truncated = False
+        for cif_v, doc, parent_id in resolved:
+            if not parent_id:
+                no_parent += 1
+                continue
+            if len(rows) >= max_docs:
+                truncated = True
+                break
+            rows.append(
+                ItemRow(
+                    item=doc,
+                    cif=cif_v,
+                    source_folder_id=parent_id,
+                    target_folder_id=target_by_cif[cif_v].object_id,
+                    selected=True,
+                )
+            )
+
+        if no_parent:
+            self._log(
+                f"[yellow]{no_parent} doc(s) had no resolvable parent "
+                f"and were skipped.[/yellow]"
+            )
+        if multi_parent_warn:
+            self._log(
+                f"[yellow]{multi_parent_warn} doc(s) are multi-filed; "
+                f"only the first parent will be the source folder for "
+                f"moveObject.[/yellow]"
+            )
+
+        rows.sort(key=lambda r: (r.cif, r.item.name))
+        self.rows = rows
+        self._rebuild_table()
+
+        unique_cifs = len({r.cif for r in rows})
+        summary = (
+            f"{len(rows)} doc(s) across {unique_cifs} CIF(s)"
+        )
+        if truncated:
+            summary += f" (truncated at max_items={max_docs})"
+            self._log(
+                f"[yellow]Result truncated at max_items={max_docs}. "
+                f"Raise the cap or filter by CIF to migrate the rest.[/yellow]"
+            )
+        status.update(f"[green]{summary}[/green]")
+        self._log(f"[green]{summary}[/green]")
+        self.query_one("#progress", ProgressBar).update(
+            total=len(rows), progress=0
         )
 
     async def _create_missing_targets(

@@ -604,6 +604,83 @@ class CmisClient:
             )
         return results
 
+    async def list_documents_of_type_by_cif(
+        self,
+        repository_id: str,
+        doc_type_id: str,
+        *,
+        cif: str | None = None,
+        cif_property: str = "clbNonGroup.BAC_CIF",
+        max_items: int = 50_000,
+        page_size: int = 500,
+    ) -> tuple[list[tuple[CmisChild, str]], bool]:
+        """Documents of a given type filtered by their own CIF property.
+
+        Unlike list_documents_of_type_in_folder this does not need an
+        ancestor folder -- it queries the document type globally and
+        returns each match together with the value of `cif_property`
+        on that document, so the caller can route it to the right
+        target folder.
+
+        Pages through `skipCount` until the server is empty or
+        `max_items` is reached. Returns `(items, hit_cap)` where
+        `hit_cap` is True iff we stopped because we hit `max_items`
+        rather than running out of results.
+        """
+        repo = self.repository(repository_id)
+        type_qn, cif_qn = await self.resolve_query_names(
+            repository_id, doc_type_id, cif_property
+        )
+        statement = (
+            "SELECT cmis:objectId, cmis:name, cmis:contentStreamLength, "
+            "cmis:contentStreamMimeType, cmis:lastModificationDate, "
+            f"cmis:objectTypeId, {cif_qn} "
+            f"FROM {type_qn}"
+        )
+        if cif:
+            statement += f" WHERE {cif_qn} = {_q_literal(cif)}"
+
+        out: list[tuple[CmisChild, str]] = []
+        skip = 0
+        hit_cap = False
+        while len(out) < max_items:
+            batch = min(page_size, max_items - len(out))
+            data = {
+                "cmisaction": "query",
+                "statement": statement,
+                "searchAllVersions": "false",
+                "maxItems": str(batch),
+                "skipCount": str(skip),
+            }
+            resp = await self._client.post(repo.repository_url, data=data)
+            self._raise_for_status(resp)
+            payload = resp.json()
+            rows = payload.get("results", []) or []
+            if not rows:
+                break
+            rows = rows[: max_items - len(out)]
+            for row in rows:
+                props = row.get("properties", {}) or row.get("succinctProperties", {})
+                cif_val = _prop(props, cif_qn)
+                if cif_val is None:
+                    cif_val = _prop(props, cif_property)
+                child = CmisChild(
+                    object_id=_prop(props, "cmis:objectId") or "",
+                    name=_prop(props, "cmis:name") or "",
+                    is_folder=False,
+                    content_stream_length=_to_int(_prop(props, "cmis:contentStreamLength")),
+                    content_stream_mime_type=_prop(props, "cmis:contentStreamMimeType"),
+                    last_modified=_prop(props, "cmis:lastModificationDate"),
+                    object_type_id=_prop(props, "cmis:objectTypeId"),
+                )
+                out.append((child, "" if cif_val is None else str(cif_val)))
+            skip += len(rows)
+            if not payload.get("hasMoreItems", False):
+                break
+        else:
+            hit_cap = True
+        return out, hit_cap
+
     async def search_by_property(
         self,
         repository_id: str,
