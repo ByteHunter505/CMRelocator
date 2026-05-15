@@ -249,7 +249,7 @@ class CMRelocatorApp(App):
                         with Horizontal():
                             yield Label("Name contains", classes="field")
                             yield Input(
-                                placeholder="case-insensitive substring of cmis:name",
+                                placeholder="substring of cmis:name (case-sensitive)",
                                 id="search_name",
                             )
                         with Horizontal():
@@ -778,10 +778,10 @@ class CMRelocatorApp(App):
 
         status = self.query_one("#search_status", Static)
         status.update(
-            "[yellow]Searching folders + documents (UPPER LIKE)...[/yellow]"
+            "[yellow]Searching folders + documents (LIKE, case-sensitive)...[/yellow]"
         )
         self._log(
-            f"[cyan]Search:[/cyan] looking for '{term}' (case-insensitive substring) "
+            f"[cyan]Search:[/cyan] looking for '{term}' (case-sensitive substring of cmis:name) "
             f"in both folders and documents, up to {max_per_kind} per kind..."
         )
 

@@ -468,25 +468,31 @@ class CmisClient:
         max_items_per_kind: int = 1000,
         page_size: int = 500,
     ) -> list[CmisSearchResult]:
-        """Case-insensitive substring search on cmis:name.
+        """Case-sensitive substring search on cmis:name.
 
         Runs two CMIS SQL queries in parallel -- one over cmis:folder and
         one over cmis:document -- and returns the combined hit list.
-        Uses `UPPER(cmis:name) LIKE '%UPPER_TERM%'`. The term is escaped
-        for SQL single-quote literals; LIKE wildcards (% and _) inside
-        the user's term are NOT escaped, so they act as wildcards.
+        Uses `cmis:name LIKE '%TERM%'`. Note: IBM Content Manager v8's
+        CMIS query parser does NOT support UPPER()/LOWER() in the WHERE
+        clause (it's outside the CMIS standard subset and CM v8 doesn't
+        extend it), so the match is case-sensitive -- callers must
+        provide the term in the case used by the repository.
+
+        The term is escaped for SQL single-quote literals; LIKE
+        wildcards (% and _) inside the user's term are NOT escaped, so
+        they act as wildcards.
         """
         if not name_substring:
             return []
         repo = self.repository(repository_id)
-        upper = name_substring.upper().replace("'", "''")
+        escaped = name_substring.replace("'", "''")
 
         async def search_one(base_type: str) -> list[CmisSearchResult]:
             statement = (
                 "SELECT cmis:objectId, cmis:name, cmis:objectTypeId, "
                 "cmis:baseTypeId "
                 f"FROM {base_type} "
-                f"WHERE UPPER(cmis:name) LIKE '%{upper}%'"
+                f"WHERE cmis:name LIKE '%{escaped}%'"
             )
             out: list[CmisSearchResult] = []
             skip = 0
