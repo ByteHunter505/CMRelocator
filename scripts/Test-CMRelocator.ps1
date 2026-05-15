@@ -20,6 +20,10 @@
   Auth: Basic, sent preemptively (some CMIS servers do not issue a 401
   challenge so -Credential alone is not enough).
 
+  Helpers (Section/Ok/Warn/Fail/Info/Sql/CmisGet/CmisPost/MemberValue/...)
+  use hyphen-less names so PowerShell resolves them strictly as
+  script-local functions and avoids cmdlet-resolver conflicts.
+
   Compatible with Windows PowerShell 5.1 and PowerShell 7+.
 
 .PARAMETER ServiceUrl
@@ -77,19 +81,19 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# ---------- pretty output ----------
-function Write-Section([string]$title) {
+# ---------- pretty output (hyphen-less to avoid cmdlet resolver) ----------
+function Section([string]$title) {
     $bar = ('=' * 78)
     Write-Host ""
     Write-Host $bar -ForegroundColor Cyan
     Write-Host (" " + $title) -ForegroundColor Cyan
     Write-Host $bar -ForegroundColor Cyan
 }
-function Write-Ok([string]$m)   { Write-Host "[OK]   $m" -ForegroundColor Green }
-function Write-WarnLine([string]$m) { Write-Host "[WARN] $m" -ForegroundColor Yellow }
-function Write-Fail([string]$m) { Write-Host "[FAIL] $m" -ForegroundColor Red }
-function Write-Info([string]$m) { Write-Host "[INFO] $m" -ForegroundColor Gray }
-function Write-Sql([string]$s)  { Write-Host "       SQL: $s" -ForegroundColor DarkGray }
+function Ok([string]$m)   { Write-Host "[OK]   $m" -ForegroundColor Green }
+function Warn([string]$m) { Write-Host "[WARN] $m" -ForegroundColor Yellow }
+function Fail([string]$m) { Write-Host "[FAIL] $m" -ForegroundColor Red }
+function Info([string]$m) { Write-Host "[INFO] $m" -ForegroundColor Gray }
+function Sql([string]$s)  { Write-Host "       SQL: $s" -ForegroundColor DarkGray }
 
 # ---------- password + auth ----------
 if (-not $Password) {
@@ -136,7 +140,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 $ServiceUrl = $ServiceUrl.TrimEnd('/')
 
 # ---------- HTTP helpers ----------
-function Invoke-CmisGet([string]$url, [hashtable]$query) {
+function CmisGet([string]$url, [hashtable]$query) {
     $p = @{
         Method  = 'GET'
         Uri     = $url
@@ -146,7 +150,7 @@ function Invoke-CmisGet([string]$url, [hashtable]$query) {
     foreach ($k in $extra.Keys) { $p[$k] = $extra[$k] }
     return Invoke-RestMethod @p
 }
-function Invoke-CmisPost([string]$url, [hashtable]$form) {
+function CmisPost([string]$url, [hashtable]$form) {
     $p = @{
         Method      = 'POST'
         Uri         = $url
@@ -159,79 +163,79 @@ function Invoke-CmisPost([string]$url, [hashtable]$form) {
 }
 
 # ---------- PSObject property access (safe for keys with dots / hyphens) ----------
-function Get-Member-Value($obj, [string]$name) {
+function MemberValue($obj, [string]$name) {
     if ($null -eq $obj) { return $null }
     $prop = $obj.PSObject.Properties[$name]
     if ($null -eq $prop) { return $null }
     return $prop.Value
 }
-function Get-PropValue($row, [string]$key) {
-    $p = Get-Member-Value $row 'properties'
+function PropValue($row, [string]$key) {
+    $p = MemberValue $row 'properties'
     if ($p) {
-        $entry = Get-Member-Value $p $key
+        $entry = MemberValue $p $key
         if ($entry) {
-            $v = Get-Member-Value $entry 'value'
+            $v = MemberValue $entry 'value'
             if ($v -is [array]) { return $v[0] }
             return $v
         }
     }
-    $s = Get-Member-Value $row 'succinctProperties'
+    $s = MemberValue $row 'succinctProperties'
     if ($s) {
-        $v = Get-Member-Value $s $key
+        $v = MemberValue $s $key
         if ($v -is [array]) { return $v[0] }
         return $v
     }
     return $null
 }
-function Get-CifValue($row, [string]$cifQN, [string]$cifId) {
-    $v = Get-PropValue $row $cifQN
-    if ($null -eq $v) { $v = Get-PropValue $row $cifId }
+function CifValue($row, [string]$cifQN, [string]$cifId) {
+    $v = PropValue $row $cifQN
+    if ($null -eq $v) { $v = PropValue $row $cifId }
     return $v
 }
 
 # ====================================================================
 # Step 1: Service document
 # ====================================================================
-Write-Section "Step 1: Service document"
-Write-Info "GET $ServiceUrl"
-try { $svc = Invoke-CmisGet $ServiceUrl $null }
-catch { Write-Fail "GET service document failed: $($_.Exception.Message)"; exit 1 }
+Section "Step 1: Service document"
+Info "GET $ServiceUrl"
+try { $svc = CmisGet $ServiceUrl $null }
+catch { Fail "GET service document failed: $($_.Exception.Message)"; exit 1 }
 
-$repoInfo = Get-Member-Value $svc $Repository
+$repoInfo = MemberValue $svc $Repository
 if (-not $repoInfo) {
-    Write-Fail "Repository '$Repository' not found in service document."
-    Write-Info ("Available repositories: " + (($svc.PSObject.Properties.Name) -join ', '))
+    Fail "Repository '$Repository' not found in service document."
+    Info ("Available repositories: " + (($svc.PSObject.Properties.Name) -join ', '))
     exit 1
 }
-$repoUrl    = Get-Member-Value $repoInfo 'repositoryUrl'
-$rootUrl    = Get-Member-Value $repoInfo 'rootFolderUrl'
-$repoName   = Get-Member-Value $repoInfo 'repositoryName'
-$prodName   = Get-Member-Value $repoInfo 'productName'
-$prodVer    = Get-Member-Value $repoInfo 'productVersion'
-Write-Ok ("Repository '{0}' = {1} ({2} {3})" -f $Repository, $repoName, $prodName, $prodVer)
-Write-Info "repositoryUrl  = $repoUrl"
-Write-Info "rootFolderUrl  = $rootUrl"
+$repoUrl    = MemberValue $repoInfo 'repositoryUrl'
+$rootUrl    = MemberValue $repoInfo 'rootFolderUrl'
+$repoName   = MemberValue $repoInfo 'repositoryName'
+$prodName   = MemberValue $repoInfo 'productName'
+$prodVer    = MemberValue $repoInfo 'productVersion'
+Ok ("Repository '{0}' = {1} ({2} {3})" -f $Repository, $repoName, $prodName, $prodVer)
+Info "repositoryUrl  = $repoUrl"
+Info "rootFolderUrl  = $rootUrl"
 
 # ---------- type definition resolver ----------
-function Resolve-QueryNames([string]$typeId) {
-    $td = Invoke-CmisGet $repoUrl @{ cmisselector = 'typeDefinition'; typeId = $typeId }
-    $typeQN = Get-Member-Value $td 'queryName'
+function ResolveQueryNames([string]$typeId) {
+    $td = CmisGet $repoUrl @{ cmisselector = 'typeDefinition'; typeId = $typeId }
+    $typeQN = MemberValue $td 'queryName'
     if (-not $typeQN) { throw "Type '$typeId' has no queryName in its definition." }
-    $pdMap = Get-Member-Value $td 'propertyDefinitions'
+    $pdMap = MemberValue $td 'propertyDefinitions'
     if (-not $pdMap) { throw "Type '$typeId' has no propertyDefinitions." }
-    $pdef = Get-Member-Value $pdMap $CifPropertyId
+    $pdef = MemberValue $pdMap $CifPropertyId
     if (-not $pdef) {
         # Try matching by inner .id (CMIS allows different keying schemes)
         foreach ($p in $pdMap.PSObject.Properties) {
             $cand = $p.Value
-            if ((Get-Member-Value $cand 'id') -eq $CifPropertyId) { $pdef = $cand; break }
+            if ((MemberValue $cand 'id') -eq $CifPropertyId) { $pdef = $cand; break }
         }
     }
     if (-not $pdef) {
         $sample = ($pdMap.PSObject.Properties.Name | Select-Object -First 25) -join ', '
         throw "Property '$CifPropertyId' not on type '$typeId'. First 25 property ids: $sample"
     }
-    $propQN = Get-Member-Value $pdef 'queryName'
+    $propQN = MemberValue $pdef 'queryName'
     if (-not $propQN) { throw "Property '$CifPropertyId' on type '$typeId' has no queryName." }
     return @{ TypeQN = $typeQN; PropQN = $propQN }
 }
@@ -239,28 +243,28 @@ function Resolve-QueryNames([string]$typeId) {
 # ====================================================================
 # Step 2: Source type definition
 # ====================================================================
-Write-Section "Step 2: Source type definition  ($SourceTypeId)"
+Section "Step 2: Source type definition  ($SourceTypeId)"
 try {
-    $src = Resolve-QueryNames $SourceTypeId
-    Write-Ok ("Source type queryName  = {0}" -f $src.TypeQN)
-    Write-Ok ("CIF property queryName = {0}" -f $src.PropQN)
-} catch { Write-Fail $_.Exception.Message; exit 1 }
+    $src = ResolveQueryNames $SourceTypeId
+    Ok ("Source type queryName  = {0}" -f $src.TypeQN)
+    Ok ("CIF property queryName = {0}" -f $src.PropQN)
+} catch { Fail $_.Exception.Message; exit 1 }
 
 # ====================================================================
 # Step 3: Target type definition
 # ====================================================================
-Write-Section "Step 3: Target type definition  ($TargetTypeId)"
+Section "Step 3: Target type definition  ($TargetTypeId)"
 try {
-    $tgt = Resolve-QueryNames $TargetTypeId
-    Write-Ok ("Target type queryName  = {0}" -f $tgt.TypeQN)
-    Write-Ok ("CIF property queryName = {0}" -f $tgt.PropQN)
-} catch { Write-Fail $_.Exception.Message; exit 1 }
+    $tgt = ResolveQueryNames $TargetTypeId
+    Ok ("Target type queryName  = {0}" -f $tgt.TypeQN)
+    Ok ("CIF property queryName = {0}" -f $tgt.PropQN)
+} catch { Fail $_.Exception.Message; exit 1 }
 
 # ---------- folder listing helper ----------
-function Query-Folders([string]$typeQN, [string]$cifQN, [int]$maxItems = 50) {
+function QueryFolders([string]$typeQN, [string]$cifQN, [int]$maxItems = 50) {
     $stmt = "SELECT cmis:objectId, cmis:name, $cifQN FROM $typeQN"
-    Write-Sql $stmt
-    return Invoke-CmisPost $repoUrl @{
+    Sql $stmt
+    return CmisPost $repoUrl @{
         cmisaction        = 'query'
         statement         = $stmt
         searchAllVersions = 'false'
@@ -268,19 +272,19 @@ function Query-Folders([string]$typeQN, [string]$cifQN, [int]$maxItems = 50) {
         skipCount         = 0
     }
 }
-function Show-FolderSample($res, [string]$cifQN, [string]$label) {
-    $rows = @(Get-Member-Value $res 'results')
-    $num  = Get-Member-Value $res 'numItems'
+function ShowFolderSample($res, [string]$cifQN, [string]$label) {
+    $rows = @(MemberValue $res 'results')
+    $num  = MemberValue $res 'numItems'
     if ($rows.Count -eq 0) {
-        Write-WarnLine "$label folders returned: 0 (numItems=$num)"
+        Warn "$label folders returned: 0 (numItems=$num)"
         return @()
     }
-    Write-Ok "$label folders returned: $($rows.Count) (numItems=$num)"
+    Ok "$label folders returned: $($rows.Count) (numItems=$num)"
     $sample = foreach ($r in $rows) {
         [pscustomobject]@{
-            CIF      = Get-CifValue $r $cifQN $CifPropertyId
-            Name     = Get-PropValue $r 'cmis:name'
-            ObjectId = Get-PropValue $r 'cmis:objectId'
+            CIF      = CifValue $r $cifQN $CifPropertyId
+            Name     = PropValue $r 'cmis:name'
+            ObjectId = PropValue $r 'cmis:objectId'
         }
     }
     $sample | Select-Object -First 10 | Format-Table -AutoSize | Out-String | Write-Host
@@ -290,105 +294,105 @@ function Show-FolderSample($res, [string]$cifQN, [string]$label) {
 # ====================================================================
 # Step 4: Source folders sample
 # ====================================================================
-Write-Section "Step 4: Source folders (no filter, first 50)"
+Section "Step 4: Source folders (no filter, first 50)"
 try {
-    $srcRes  = Query-Folders $src.TypeQN $src.PropQN 50
-    $srcRows = Show-FolderSample $srcRes $src.PropQN "Source"
-} catch { Write-Fail $_.Exception.Message; exit 1 }
+    $srcRes  = QueryFolders $src.TypeQN $src.PropQN 50
+    $srcRows = ShowFolderSample $srcRes $src.PropQN "Source"
+} catch { Fail $_.Exception.Message; exit 1 }
 
 # ====================================================================
 # Step 5: Target folders sample + overlap
 # ====================================================================
-Write-Section "Step 5: Target folders (no filter, first 50)"
+Section "Step 5: Target folders (no filter, first 50)"
 try {
-    $tgtRes  = Query-Folders $tgt.TypeQN $tgt.PropQN 50
-    $tgtRows = Show-FolderSample $tgtRes $tgt.PropQN "Target"
-} catch { Write-Fail $_.Exception.Message; exit 1 }
+    $tgtRes  = QueryFolders $tgt.TypeQN $tgt.PropQN 50
+    $tgtRows = ShowFolderSample $tgtRes $tgt.PropQN "Target"
+} catch { Fail $_.Exception.Message; exit 1 }
 
-Write-Section "Step 5b: Source-target CIF overlap (in samples)"
+Section "Step 5b: Source-target CIF overlap (in samples)"
 $srcCifs = $srcRows | Where-Object { $_.CIF } | ForEach-Object { "$($_.CIF)" } | Sort-Object -Unique
 $tgtCifs = $tgtRows | Where-Object { $_.CIF } | ForEach-Object { "$($_.CIF)" } | Sort-Object -Unique
 $overlap = @($srcCifs | Where-Object { $tgtCifs -contains $_ })
-Write-Info "Distinct source CIFs: $($srcCifs.Count)"
-Write-Info "Distinct target CIFs: $($tgtCifs.Count)"
+Info "Distinct source CIFs: $($srcCifs.Count)"
+Info "Distinct target CIFs: $($tgtCifs.Count)"
 if ($overlap.Count -eq 0) {
-    Write-WarnLine "No overlapping CIFs in first 50 of each. Sample may be too small, or types do not share customers."
+    Warn "No overlapping CIFs in first 50 of each. Sample may be too small, or types do not share customers."
 } else {
     $first = ($overlap | Select-Object -First 5) -join ', '
-    Write-Ok "Overlapping CIFs (sample): $($overlap.Count). First few: $first"
+    Ok "Overlapping CIFs (sample): $($overlap.Count). First few: $first"
 }
 
 # ====================================================================
 # Step 6: Specific CIF lookup
 # ====================================================================
 if ($Cif) {
-    Write-Section "Step 6: Lookup for CIF = $Cif"
+    Section "Step 6: Lookup for CIF = $Cif"
     $found = $false
     foreach ($mode in @('string','numeric')) {
         $literal = if ($mode -eq 'string') { "'$Cif'" } else { $Cif }
         Write-Host ""
-        Write-Info "Trying $mode literal: $literal"
+        Info "Trying $mode literal: $literal"
 
         $stmt = "SELECT cmis:objectId, cmis:name FROM $($src.TypeQN) WHERE $($src.PropQN) = $literal"
-        Write-Sql $stmt
+        Sql $stmt
         try {
-            $r = Invoke-CmisPost $repoUrl @{
+            $r = CmisPost $repoUrl @{
                 cmisaction = 'query'; statement = $stmt; maxItems = 5; skipCount = 0
             }
         } catch {
-            Write-Fail "Source query failed: $($_.Exception.Message)"
+            Fail "Source query failed: $($_.Exception.Message)"
             continue
         }
-        $rowsS = @(Get-Member-Value $r 'results')
+        $rowsS = @(MemberValue $r 'results')
         if ($rowsS.Count -eq 0) {
-            Write-WarnLine "Source returned 0 folders with $mode literal."
+            Warn "Source returned 0 folders with $mode literal."
             continue
         }
-        Write-Ok "Source matched $($rowsS.Count) folder(s) using $mode CIF."
-        $srcFolder = Get-PropValue $rowsS[0] 'cmis:objectId'
-        Write-Info "First source objectId: $srcFolder"
+        Ok "Source matched $($rowsS.Count) folder(s) using $mode CIF."
+        $srcFolder = PropValue $rowsS[0] 'cmis:objectId'
+        Info "First source objectId: $srcFolder"
 
         $stmt2 = "SELECT cmis:objectId, cmis:name FROM $($tgt.TypeQN) WHERE $($tgt.PropQN) = $literal"
-        Write-Sql $stmt2
+        Sql $stmt2
         try {
-            $r2 = Invoke-CmisPost $repoUrl @{
+            $r2 = CmisPost $repoUrl @{
                 cmisaction = 'query'; statement = $stmt2; maxItems = 5; skipCount = 0
             }
         } catch {
-            Write-Fail "Target query failed: $($_.Exception.Message)"
+            Fail "Target query failed: $($_.Exception.Message)"
             continue
         }
-        $rowsT = @(Get-Member-Value $r2 'results')
+        $rowsT = @(MemberValue $r2 'results')
         if ($rowsT.Count -eq 0) {
-            Write-WarnLine "Target has NO folder for CIF $Cif (using $mode literal). This CIF would be skipped."
+            Warn "Target has NO folder for CIF $Cif (using $mode literal). This CIF would be skipped."
             $found = $true
             break
         }
-        Write-Ok "Target matched $($rowsT.Count) folder(s) using $mode CIF."
-        $tgtFolder = Get-PropValue $rowsT[0] 'cmis:objectId'
-        Write-Info "First target objectId: $tgtFolder"
+        Ok "Target matched $($rowsT.Count) folder(s) using $mode CIF."
+        $tgtFolder = PropValue $rowsT[0] 'cmis:objectId'
+        Info "First target objectId: $tgtFolder"
 
         # Documents IN_FOLDER source
-        Write-Section "Step 6b: Documents IN_FOLDER source"
+        Section "Step 6b: Documents IN_FOLDER source"
         $escFolder = $srcFolder -replace "'", "''"
         $stmt3 = "SELECT cmis:objectId, cmis:name FROM cmis:document WHERE IN_FOLDER('$escFolder')"
-        Write-Sql $stmt3
+        Sql $stmt3
         try {
-            $r3 = Invoke-CmisPost $repoUrl @{
+            $r3 = CmisPost $repoUrl @{
                 cmisaction = 'query'; statement = $stmt3; maxItems = 20; skipCount = 0
             }
         } catch {
-            Write-Fail "Document listing failed: $($_.Exception.Message)"
+            Fail "Document listing failed: $($_.Exception.Message)"
             $found = $true
             break
         }
-        $rowsD = @(Get-Member-Value $r3 'results')
+        $rowsD = @(MemberValue $r3 'results')
         if ($rowsD.Count -eq 0) {
-            Write-WarnLine "Source folder contains 0 documents (nothing to migrate)."
+            Warn "Source folder contains 0 documents (nothing to migrate)."
         } else {
-            Write-Ok "Source folder contains $($rowsD.Count) document(s):"
+            Ok "Source folder contains $($rowsD.Count) document(s):"
             $rowsD | Select-Object -First 20 | ForEach-Object {
-                "  - {0,-40}  [{1}]" -f (Get-PropValue $_ 'cmis:name'), (Get-PropValue $_ 'cmis:objectId') |
+                "  - {0,-40}  [{1}]" -f (PropValue $_ 'cmis:name'), (PropValue $_ 'cmis:objectId') |
                     Write-Host
             }
         }
@@ -396,17 +400,17 @@ if ($Cif) {
         break
     }
     if (-not $found) {
-        Write-WarnLine "No source folder matched CIF $Cif in either string or numeric literal mode."
-        Write-Info "Possible causes: typo, CIF stored under a different property, or CIF not in this type."
+        Warn "No source folder matched CIF $Cif in either string or numeric literal mode."
+        Info "Possible causes: typo, CIF stored under a different property, or CIF not in this type."
     }
 }
 
 # ====================================================================
 # Hints
 # ====================================================================
-Write-Section "Interpretation guide"
-Write-Info "Step 4 = 0 folders                  -> SourceTypeId is wrong, or no instances exist."
-Write-Info "Step 5 = 0 folders                  -> TargetTypeId is wrong, or no instances exist."
-Write-Info "Step 5b overlap = 0                 -> Source and target types do not share CIFs (small sample? wrong types?)"
-Write-Info "Step 6 string fails, numeric works  -> CIF column is numeric; the TUI must send unquoted literals."
-Write-Info "Step 6 both fail                    -> The CIF you typed does not exist on the source type, or wrong property."
+Section "Interpretation guide"
+Info "Step 4 = 0 folders                  -> SourceTypeId is wrong, or no instances exist."
+Info "Step 5 = 0 folders                  -> TargetTypeId is wrong, or no instances exist."
+Info "Step 5b overlap = 0                 -> Source and target types do not share CIFs (small sample? wrong types?)"
+Info "Step 6 string fails, numeric works  -> CIF column is numeric; the TUI must send unquoted literals."
+Info "Step 6 both fail                    -> The CIF you typed does not exist on the source type, or wrong property."
