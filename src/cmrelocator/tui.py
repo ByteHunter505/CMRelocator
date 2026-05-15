@@ -44,12 +44,12 @@ class CMRelocatorApp(App):
 
     #top-form {
         height: auto;
-        max-height: 26;
+        max-height: 28;
     }
 
-    .checkrow {
-        height: 1;
-        margin: 0 0 0 1;
+    Checkbox {
+        margin: 0 1;
+        background: transparent;
     }
 
     #connection, #matching {
@@ -148,12 +148,10 @@ class CMRelocatorApp(App):
                 yield Checkbox(
                     "Create target folder if it doesn't exist",
                     id="opt_create_target",
-                    classes="checkrow",
                 )
                 yield Checkbox(
                     "Delete empty source folder after migration",
                     id="opt_delete_source",
-                    classes="checkrow",
                 )
                 with Horizontal():
                     yield Button("Query items", id="query", variant="primary")
