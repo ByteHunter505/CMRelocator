@@ -9,6 +9,7 @@ Only the operations needed by CMRelocator are implemented:
 - get_type_definition    -> full type definition (id, queryName, properties)
 - list_documents_in_folder
 - list_folders_by_type   -> folders of a custom ItemType filtered by CIF
+- list_children          -> direct children (folders + docs) of a folder
 - move_object            -> CMIS moveObject (cmisaction=move)
 
 CMIS SQL note: The OASIS CMIS 1.1 grammar does not allow quoted identifiers.
@@ -64,6 +65,18 @@ class CmisFolder:
     name: str
     cif: str
     object_type_id: str
+
+
+@dataclass
+class CmisChild:
+    """A direct child of a folder (either a sub-folder or a document)."""
+    object_id: str
+    name: str
+    is_folder: bool
+    content_stream_length: int | None
+    content_stream_mime_type: str | None
+    last_modified: str | None
+    object_type_id: str | None
 
 
 class CmisClient:
@@ -261,6 +274,49 @@ class CmisClient:
                 )
             )
         return folders
+
+    async def list_children(
+        self,
+        repository_id: str,
+        folder_id: str,
+        *,
+        max_items: int = 1000,
+    ) -> list[CmisChild]:
+        """List direct children (sub-folders + documents) of a folder.
+
+        Uses the CMIS Browser Binding `children` selector, which returns all
+        child objects regardless of base type. This is what the migration
+        flow uses: each child is moved into the target folder via
+        moveObject, and CMIS atomically re-parents folders along with their
+        entire subtree.
+        """
+        repo = self.repository(repository_id)
+        params = {
+            "cmisselector": "children",
+            "objectId": folder_id,
+            "maxItems": str(max_items),
+            "skipCount": "0",
+        }
+        resp = await self._client.get(repo.root_folder_url, params=params)
+        self._raise_for_status(resp)
+        payload = resp.json()
+        results: list[CmisChild] = []
+        for entry in payload.get("objects", []):
+            obj = entry.get("object", entry)
+            props = obj.get("properties", {}) or obj.get("succinctProperties", {})
+            base_type = _prop(props, "cmis:baseTypeId") or ""
+            results.append(
+                CmisChild(
+                    object_id=_prop(props, "cmis:objectId") or "",
+                    name=_prop(props, "cmis:name") or "",
+                    is_folder=(base_type == "cmis:folder"),
+                    content_stream_length=_to_int(_prop(props, "cmis:contentStreamLength")),
+                    content_stream_mime_type=_prop(props, "cmis:contentStreamMimeType"),
+                    last_modified=_prop(props, "cmis:lastModificationDate"),
+                    object_type_id=_prop(props, "cmis:objectTypeId"),
+                )
+            )
+        return results
 
     async def move_object(
         self,

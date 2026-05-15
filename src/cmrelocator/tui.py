@@ -20,12 +20,12 @@ from textual.widgets import (
     Static,
 )
 
-from cmrelocator.cmis_client import CmisClient, CmisDocument, CmisError
+from cmrelocator.cmis_client import CmisChild, CmisClient, CmisError
 
 
 @dataclass
-class DocumentRow:
-    doc: CmisDocument
+class ItemRow:
+    item: CmisChild
     cif: str
     source_folder_id: str
     target_folder_id: str
@@ -88,7 +88,7 @@ class CMRelocatorApp(App):
 
     def __init__(self) -> None:
         super().__init__()
-        self.rows: list[DocumentRow] = []
+        self.rows: list[ItemRow] = []
         self._client: CmisClient | None = None
         self._repo_id: str = ""
 
@@ -125,13 +125,13 @@ class CMRelocatorApp(App):
                     yield Label("CIF (optional)", classes="field")
                     yield Input(placeholder="empty = migrate all customers", id="cif")
                 with Horizontal():
-                    yield Label("Max documents", classes="field")
+                    yield Label("Max items", classes="field")
                     yield Input(value="5000", id="max_docs", restrict=r"[0-9]*")
                 with Horizontal():
                     yield Label("Max parallel", classes="field")
                     yield Input(value="4", id="concurrency", restrict=r"[0-9]*")
                 with Horizontal():
-                    yield Button("Query documents", id="query", variant="primary")
+                    yield Button("Query items", id="query", variant="primary")
                     yield Static("", id="query_status")
 
             yield DataTable(id="docs", zebra_stripes=True, cursor_type="row")
@@ -152,7 +152,8 @@ class CMRelocatorApp(App):
         table = self.query_one("#docs", DataTable)
         table.add_column("Sel", key="sel", width=4)
         table.add_column("CIF", key="cif", width=14)
-        table.add_column("Document", key="name", width=40)
+        table.add_column("Kind", key="kind", width=5)
+        table.add_column("Name", key="name", width=38)
         table.add_column("Size", key="size", width=12)
         table.add_column("MIME", key="mime", width=22)
         table.add_column("Modified", key="modified", width=22)
@@ -278,7 +279,7 @@ class CMRelocatorApp(App):
             return
 
         status.update(
-            f"[yellow]Listing documents in {len(pairs)} folder(s)...[/yellow]"
+            f"[yellow]Listing items in {len(pairs)} folder(s)...[/yellow]"
         )
 
         sem = asyncio.Semaphore(concurrency)
@@ -286,7 +287,7 @@ class CMRelocatorApp(App):
         async def list_for(cif_v: str, source_id: str, target_id: str):
             async with sem:
                 try:
-                    docs = await self._client.list_documents_in_folder(
+                    children = await self._client.list_children(
                         self._repo_id, source_id
                     )
                 except Exception as exc:
@@ -295,22 +296,22 @@ class CMRelocatorApp(App):
                         f"(CIF {cif_v}): {exc}[/red]"
                     )
                     return []
-                return [(cif_v, source_id, target_id, d) for d in docs]
+                return [(cif_v, source_id, target_id, c) for c in children]
 
         batches = await asyncio.gather(
             *(list_for(c, s, t) for c, s, t in pairs)
         )
 
-        rows: list[DocumentRow] = []
+        rows: list[ItemRow] = []
         truncated = False
         for batch in batches:
-            for cif_v, src, tgt, doc in batch:
+            for cif_v, src, tgt, child in batch:
                 if len(rows) >= max_docs:
                     truncated = True
                     break
                 rows.append(
-                    DocumentRow(
-                        doc=doc,
+                    ItemRow(
+                        item=child,
                         cif=cif_v,
                         source_folder_id=src,
                         target_folder_id=tgt,
@@ -320,33 +321,43 @@ class CMRelocatorApp(App):
             if truncated:
                 break
 
-        rows.sort(key=lambda r: (r.cif, r.doc.name))
+        rows.sort(key=lambda r: (r.cif, not r.item.is_folder, r.item.name))
         self.rows = rows
         self._rebuild_table()
 
         unique_cifs = len({r.cif for r in rows})
-        summary = f"{len(rows)} documents across {unique_cifs} CIF(s)"
+        n_folders = sum(1 for r in rows if r.item.is_folder)
+        n_docs = len(rows) - n_folders
+        summary = (
+            f"{len(rows)} items ({n_folders} folders, {n_docs} docs) "
+            f"across {unique_cifs} CIF(s)"
+        )
         if truncated:
-            summary += f" (truncated at max_docs={max_docs})"
+            summary += f" (truncated at max_items={max_docs})"
             self._log(
-                f"[yellow]Result truncated at max_docs={max_docs}. "
+                f"[yellow]Result truncated at max_items={max_docs}. "
                 f"Raise the cap or filter by CIF to migrate the rest.[/yellow]"
             )
         status.update(f"[green]{summary}[/green]")
         self._log(f"[green]{summary}[/green]")
+        self._log(
+            "[dim]Folders will be moved with their entire subtree (CMIS moveObject).[/dim]"
+        )
         self.query_one("#progress", ProgressBar).update(total=len(rows), progress=0)
 
     def _rebuild_table(self) -> None:
         table = self.query_one("#docs", DataTable)
         table.clear()
         for idx, row in enumerate(self.rows):
+            kind = "[F]" if row.item.is_folder else "[D]"
             table.add_row(
                 _checkbox(row.selected),
                 row.cif,
-                row.doc.name,
-                _fmt_size(row.doc.content_stream_length),
-                row.doc.content_stream_mime_type or "",
-                (row.doc.last_modified or "")[:19],
+                kind,
+                row.item.name,
+                _fmt_size(row.item.content_stream_length) if not row.item.is_folder else "",
+                row.item.content_stream_mime_type or "",
+                (row.item.last_modified or "")[:19],
                 _status_text(row.status, row.error),
                 key=str(idx),
             )
@@ -421,46 +432,49 @@ class CMRelocatorApp(App):
             if row.selected and row.status != "done"
         ]
         if not targets:
-            self._log("[yellow]No documents selected (or all already moved).[/yellow]")
+            self._log("[yellow]No items selected (or all already moved).[/yellow]")
             return
 
         progress = self.query_one("#progress", ProgressBar)
         progress.update(total=len(targets), progress=0)
         self._log(
-            f"[cyan]Migrating {len(targets)} documents "
+            f"[cyan]Migrating {len(targets)} items "
             f"(concurrency={concurrency})...[/cyan]"
         )
 
         sem = asyncio.Semaphore(concurrency)
         counters = {"ok": 0, "fail": 0}
 
-        async def move_one(idx: int, row: DocumentRow) -> None:
+        async def move_one(idx: int, row: ItemRow) -> None:
             async with sem:
                 row.status = "moving"
                 self._update_row(idx)
+                kind = "[F]" if row.item.is_folder else "[D]"
                 try:
                     await self._client.move_object(  # type: ignore[union-attr]
                         self._repo_id,
-                        row.doc.object_id,
+                        row.item.object_id,
                         row.source_folder_id,
                         row.target_folder_id,
                     )
                     row.status = "done"
                     counters["ok"] += 1
-                    self._log(f"[green]OK[/green]  CIF {row.cif} - {row.doc.name}")
+                    self._log(
+                        f"[green]OK[/green]   CIF {row.cif} {kind} {row.item.name}"
+                    )
                 except CmisError as exc:
                     row.status = "error"
                     row.error = str(exc)
                     counters["fail"] += 1
                     self._log(
-                        f"[red]FAIL[/red] CIF {row.cif} - {row.doc.name}: {exc}"
+                        f"[red]FAIL[/red] CIF {row.cif} {kind} {row.item.name}: {exc}"
                     )
                 except Exception as exc:
                     row.status = "error"
                     row.error = repr(exc)
                     counters["fail"] += 1
                     self._log(
-                        f"[red]FAIL[/red] CIF {row.cif} - {row.doc.name}: {exc!r}"
+                        f"[red]FAIL[/red] CIF {row.cif} {kind} {row.item.name}: {exc!r}"
                     )
                 finally:
                     self._update_row(idx)
