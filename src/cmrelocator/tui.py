@@ -242,18 +242,30 @@ class CMRelocatorApp(App):
 
                 yield ProgressBar(id="progress", show_eta=True)
 
-            with TabPane("Search by name", id="tab_search"):
+            with TabPane("Search", id="tab_search"):
                 with VerticalScroll(id="search-form"):
                     with Vertical(id="search-panel"):
-                        yield Static("[b]Search by name[/b]")
+                        yield Static("[b]Search folders by a custom property[/b]")
                         with Horizontal():
-                            yield Label("Name contains", classes="field")
+                            yield Label("Folder type", classes="field")
                             yield Input(
-                                placeholder="substring of cmis:name (case-sensitive)",
-                                id="search_name",
+                                placeholder="$p!-2_BAC_01_01_01_02v-1",
+                                id="search_type",
                             )
                         with Horizontal():
-                            yield Label("Max per kind", classes="field")
+                            yield Label("Property", classes="field")
+                            yield Input(
+                                value="clbNonGroup.BAC_Nombre_Carpeta",
+                                id="search_property",
+                            )
+                        with Horizontal():
+                            yield Label("Value contains", classes="field")
+                            yield Input(
+                                placeholder="case-sensitive substring (LIKE %value%)",
+                                id="search_value",
+                            )
+                        with Horizontal():
+                            yield Label("Max results", classes="field")
                             yield Input(
                                 value="500",
                                 id="search_max",
@@ -286,9 +298,9 @@ class CMRelocatorApp(App):
 
         # Search-tab results table
         sr = self.query_one("#search_results", DataTable)
-        sr.add_column("Kind", key="kind", width=5)
-        sr.add_column("Name", key="name", width=40)
-        sr.add_column("Type ID", key="type", width=34)
+        sr.add_column("Name (cmis:name)", key="name", width=28)
+        sr.add_column("Property value", key="value", width=34)
+        sr.add_column("Type ID", key="type", width=28)
         sr.add_column("ObjectId", key="object_id")
 
         self._log("[dim]Ready. Fill connection fields and press Connect.[/dim]")
@@ -765,11 +777,19 @@ class CMRelocatorApp(App):
         if self._client is None:
             self._log("[red]Connect first.[/red]")
             return
-        term = self.query_one("#search_name", Input).value.strip()
-        if not term:
-            self._log("[red]Type a name substring to search for.[/red]")
+        type_id = self.query_one("#search_type", Input).value.strip()
+        prop_id = self.query_one("#search_property", Input).value.strip()
+        value = self.query_one("#search_value", Input).value.strip()
+        if not type_id:
+            self._log("[red]Provide the Folder Type ID to search in.[/red]")
             return
-        max_per_kind = _safe_int(
+        if not prop_id:
+            self._log("[red]Provide the property to search.[/red]")
+            return
+        if not value:
+            self._log("[red]Type a value substring to search for.[/red]")
+            return
+        max_items = _safe_int(
             self.query_one("#search_max", Input).value,
             default=500,
             lo=1,
@@ -777,56 +797,52 @@ class CMRelocatorApp(App):
         )
 
         status = self.query_one("#search_status", Static)
-        status.update(
-            "[yellow]Searching folders + documents (LIKE, case-sensitive)...[/yellow]"
-        )
+        status.update("[yellow]Searching (LIKE, case-sensitive)...[/yellow]")
         self._log(
-            f"[cyan]Search:[/cyan] looking for '{term}' (case-sensitive substring of cmis:name) "
-            f"in both folders and documents, up to {max_per_kind} per kind..."
+            f"[cyan]Search:[/cyan] type={type_id}  property={prop_id}  "
+            f"value LIKE '%{value}%'  (max {max_items})"
         )
 
         try:
-            hits = await self._client.search_objects_by_name(
-                self._repo_id, term, max_items_per_kind=max_per_kind
+            hits, type_qn, prop_qn = await self._client.search_by_property(
+                self._repo_id,
+                type_id,
+                prop_id,
+                value,
+                max_items=max_items,
             )
         except Exception as exc:
             status.update("[red]Search failed[/red]")
             self._log(f"[red]Search failed: {exc}[/red]")
             return
 
-        # Sort: folders first, then documents; within each, by name.
-        hits.sort(key=lambda h: (not h.is_folder, h.name.lower()))
+        self._log(
+            f"[dim]Resolved queryNames -> type={type_qn}  property={prop_qn}[/dim]"
+        )
+        hits.sort(key=lambda h: h.property_value.lower())
         self.search_hits = hits
 
-        n_folders = sum(1 for h in hits if h.is_folder)
-        n_docs = len(hits) - n_folders
-        status.update(
-            f"[green]{len(hits)} hit(s) -- {n_folders} folders, {n_docs} docs[/green]"
-        )
-        self._log(
-            f"[green]Search done.[/green] {len(hits)} hit(s): "
-            f"{n_folders} folder(s), {n_docs} document(s)."
-        )
+        status.update(f"[green]{len(hits)} hit(s)[/green]")
+        self._log(f"[green]Search done.[/green] {len(hits)} hit(s).")
 
         table = self.query_one("#search_results", DataTable)
         table.clear()
         for idx, h in enumerate(hits):
-            kind = "[F]" if h.is_folder else "[D]"
             table.add_row(
-                kind, h.name, h.object_type_id, h.object_id, key=str(idx)
+                h.name, h.property_value, h.object_type_id, h.object_id,
+                key=str(idx),
             )
 
         if hits:
             self._log(
-                "[dim]Click a row in the results table to see the full "
-                "ObjectId echoed in this log (easy to copy).[/dim]"
+                "[dim]Click a row to echo the full ObjectId to this log "
+                "(easy to copy into Source/Target Type ID fields).[/dim]"
             )
 
     @on(DataTable.RowSelected, "#search_results")
     def handle_search_row_selected(
         self, event: DataTable.RowSelected
     ) -> None:
-        # Echo the full ObjectId to the log so the user can copy it cleanly.
         if event.row_key.value is None:
             return
         try:
@@ -836,9 +852,9 @@ class CMRelocatorApp(App):
         if not (0 <= idx < len(self.search_hits)):
             return
         h = self.search_hits[idx]
-        kind = "folder" if h.is_folder else "document"
         self._log(
-            f"[cyan]{kind}[/cyan]  name={h.name!r}  type={h.object_type_id}  "
+            f"name={h.name!r}  property_value={h.property_value!r}  "
+            f"type={h.object_type_id}  "
             f"objectId=[bold]{h.object_id}[/bold]"
         )
 

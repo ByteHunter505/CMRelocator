@@ -12,7 +12,7 @@ Only the operations needed by CMRelocator are implemented:
 - list_documents_of_type_in_folder -> docs of a specific type in a folder
 - list_folders_by_type        -> folders of a custom ItemType filtered by CIF
 - list_children               -> direct children (folders + docs) of a folder
-- search_objects_by_name      -> case-insensitive substring search on cmis:name
+- search_by_property          -> LIKE substring search on a custom property of a type
 - create_folder               -> CMIS createFolder
 - move_object                 -> CMIS moveObject (cmisaction=move)
 - delete_object               -> CMIS deleteObject (cmisaction=delete)
@@ -23,7 +23,6 @@ This client resolves queryNames automatically via getTypeDefinition.
 """
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -87,15 +86,11 @@ class CmisChild:
 
 @dataclass
 class CmisSearchResult:
-    """A name-search hit. Either a folder or a document."""
+    """A property-search hit on a single custom ItemType."""
     object_id: str
     name: str
     object_type_id: str
-    base_type_id: str
-
-    @property
-    def is_folder(self) -> bool:
-        return self.base_type_id == "cmis:folder"
+    property_value: str
 
 
 class CmisClient:
@@ -460,93 +455,84 @@ class CmisClient:
             )
         return results
 
-    async def search_objects_by_name(
+    async def search_by_property(
         self,
         repository_id: str,
-        name_substring: str,
+        type_id: str,
+        property_id: str,
+        value_substring: str,
         *,
-        max_items_per_kind: int = 1000,
+        max_items: int = 1000,
         page_size: int = 500,
-    ) -> list[CmisSearchResult]:
-        """Case-sensitive substring search on cmis:name.
+    ) -> tuple[list[CmisSearchResult], str, str]:
+        """Substring search on a custom property of a specific ItemType.
 
-        Runs two CMIS SQL queries in parallel -- one over cmis:folder and
-        one over cmis:document -- and returns the combined hit list.
-        Uses `cmis:name LIKE '%TERM%'`. Note: IBM Content Manager v8's
-        CMIS query parser does NOT support UPPER()/LOWER() in the WHERE
-        clause (it's outside the CMIS standard subset and CM v8 doesn't
-        extend it), so the match is case-sensitive -- callers must
-        provide the term in the case used by the repository.
+        Runs `SELECT ... FROM <type_qn> WHERE <prop_qn> LIKE '%VALUE%'`,
+        resolving queryNames for both the type and the property. Match
+        is case-sensitive (CM v8's CMIS parser does not support UPPER()).
 
-        The term is escaped for SQL single-quote literals; LIKE
-        wildcards (% and _) inside the user's term are NOT escaped, so
-        they act as wildcards.
+        `value_substring` is escaped for SQL single-quote literals. LIKE
+        wildcards (% and _) inside the value are NOT escaped, so they
+        act as wildcards.
 
-        Type and property references in the SQL must be the repository's
-        queryName, not the typeId -- CMIS SQL has no quoted identifiers
-        and the typeId for cmis:folder / cmis:document is not always a
-        valid SQL identifier. We resolve queryNames for both base types
-        (and the cmis:name property) via getTypeDefinition before
-        building each statement.
+        Returns (hits, type_queryName, property_queryName). The latter
+        two are returned so the UI can display the exact SQL identifiers
+        that were used.
         """
-        if not name_substring:
-            return []
+        if not value_substring:
+            return [], "", ""
         repo = self.repository(repository_id)
-        escaped = name_substring.replace("'", "''")
-
-        async def search_one(base_type: str) -> list[CmisSearchResult]:
-            type_qn, name_qn = await self.resolve_query_names(
-                repository_id, base_type, "cmis:name"
-            )
-            statement = (
-                f"SELECT cmis:objectId, cmis:name, cmis:objectTypeId "
-                f"FROM {type_qn} "
-                f"WHERE {name_qn} LIKE '%{escaped}%'"
-            )
-            out: list[CmisSearchResult] = []
-            skip = 0
-            while len(out) < max_items_per_kind:
-                batch = min(page_size, max_items_per_kind - len(out))
-                data = {
-                    "cmisaction": "query",
-                    "statement": statement,
-                    "searchAllVersions": "false",
-                    "maxItems": str(batch),
-                    "skipCount": str(skip),
-                }
-                resp = await self._client.post(repo.repository_url, data=data)
-                if not resp.is_success:
-                    raise CmisError(
-                        f"HTTP {resp.status_code} for search statement "
-                        f"{statement!r}: {resp.text[:500]}",
-                        status_code=resp.status_code,
-                        body=resp.text,
-                    )
-                payload = resp.json()
-                rows = payload.get("results", []) or []
-                if not rows:
-                    break
-                rows = rows[: max_items_per_kind - len(out)]
-                for row in rows:
-                    props = row.get("properties", {}) or row.get("succinctProperties", {})
-                    out.append(
-                        CmisSearchResult(
-                            object_id=_prop(props, "cmis:objectId") or "",
-                            name=_prop(props, "cmis:name") or "",
-                            object_type_id=_prop(props, "cmis:objectTypeId") or "",
-                            base_type_id=base_type,
-                        )
-                    )
-                skip += len(rows)
-                if not payload.get("hasMoreItems", False):
-                    break
-            return out
-
-        folder_hits, doc_hits = await asyncio.gather(
-            search_one("cmis:folder"),
-            search_one("cmis:document"),
+        type_qn, prop_qn = await self.resolve_query_names(
+            repository_id, type_id, property_id
         )
-        return folder_hits + doc_hits
+        escaped = value_substring.replace("'", "''")
+        statement = (
+            f"SELECT cmis:objectId, cmis:name, cmis:objectTypeId, {prop_qn} "
+            f"FROM {type_qn} "
+            f"WHERE {prop_qn} LIKE '%{escaped}%'"
+        )
+
+        out: list[CmisSearchResult] = []
+        skip = 0
+        while len(out) < max_items:
+            batch = min(page_size, max_items - len(out))
+            data = {
+                "cmisaction": "query",
+                "statement": statement,
+                "searchAllVersions": "false",
+                "maxItems": str(batch),
+                "skipCount": str(skip),
+            }
+            resp = await self._client.post(repo.repository_url, data=data)
+            if not resp.is_success:
+                raise CmisError(
+                    f"HTTP {resp.status_code} for search statement "
+                    f"{statement!r}: {resp.text[:500]}",
+                    status_code=resp.status_code,
+                    body=resp.text,
+                )
+            payload = resp.json()
+            rows = payload.get("results", []) or []
+            if not rows:
+                break
+            rows = rows[: max_items - len(out)]
+            for row in rows:
+                props = row.get("properties", {}) or row.get("succinctProperties", {})
+                value = _prop(props, prop_qn)
+                if value is None:
+                    value = _prop(props, property_id)
+                out.append(
+                    CmisSearchResult(
+                        object_id=_prop(props, "cmis:objectId") or "",
+                        name=_prop(props, "cmis:name") or "",
+                        object_type_id=_prop(props, "cmis:objectTypeId") or type_id,
+                        property_value="" if value is None else str(value),
+                    )
+                )
+            skip += len(rows)
+            if not payload.get("hasMoreItems", False):
+                break
+        return out, type_qn, prop_qn
 
     async def move_object(
         self,
