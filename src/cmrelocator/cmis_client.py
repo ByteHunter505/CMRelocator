@@ -481,6 +481,13 @@ class CmisClient:
         The term is escaped for SQL single-quote literals; LIKE
         wildcards (% and _) inside the user's term are NOT escaped, so
         they act as wildcards.
+
+        Type and property references in the SQL must be the repository's
+        queryName, not the typeId -- CMIS SQL has no quoted identifiers
+        and the typeId for cmis:folder / cmis:document is not always a
+        valid SQL identifier. We resolve queryNames for both base types
+        (and the cmis:name property) via getTypeDefinition before
+        building each statement.
         """
         if not name_substring:
             return []
@@ -488,11 +495,13 @@ class CmisClient:
         escaped = name_substring.replace("'", "''")
 
         async def search_one(base_type: str) -> list[CmisSearchResult]:
+            type_qn, name_qn = await self.resolve_query_names(
+                repository_id, base_type, "cmis:name"
+            )
             statement = (
-                "SELECT cmis:objectId, cmis:name, cmis:objectTypeId, "
-                "cmis:baseTypeId "
-                f"FROM {base_type} "
-                f"WHERE cmis:name LIKE '%{escaped}%'"
+                f"SELECT cmis:objectId, cmis:name, cmis:objectTypeId "
+                f"FROM {type_qn} "
+                f"WHERE {name_qn} LIKE '%{escaped}%'"
             )
             out: list[CmisSearchResult] = []
             skip = 0
@@ -506,7 +515,13 @@ class CmisClient:
                     "skipCount": str(skip),
                 }
                 resp = await self._client.post(repo.repository_url, data=data)
-                self._raise_for_status(resp)
+                if not resp.is_success:
+                    raise CmisError(
+                        f"HTTP {resp.status_code} for search statement "
+                        f"{statement!r}: {resp.text[:500]}",
+                        status_code=resp.status_code,
+                        body=resp.text,
+                    )
                 payload = resp.json()
                 rows = payload.get("results", []) or []
                 if not rows:
@@ -519,7 +534,7 @@ class CmisClient:
                             object_id=_prop(props, "cmis:objectId") or "",
                             name=_prop(props, "cmis:name") or "",
                             object_type_id=_prop(props, "cmis:objectTypeId") or "",
-                            base_type_id=_prop(props, "cmis:baseTypeId") or base_type,
+                            base_type_id=base_type,
                         )
                     )
                 skip += len(rows)
