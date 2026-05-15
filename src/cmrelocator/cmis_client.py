@@ -4,16 +4,18 @@ Minimal client targeted at IBM Content Manager v8 but compatible with any
 CMIS-compliant repository exposing the Browser Binding (JSON).
 
 Only the operations needed by CMRelocator are implemented:
-- fetch_repositories     -> service document
-- get_folder             -> object properties of a folder
-- get_object_parents     -> parent folders of any object
-- get_type_definition    -> full type definition (id, queryName, properties)
+- fetch_repositories          -> service document
+- get_folder                  -> object properties of a folder
+- get_object_parents          -> parent folders of any object
+- get_type_definition         -> full type definition (id, queryName, properties)
 - list_documents_in_folder
-- list_folders_by_type   -> folders of a custom ItemType filtered by CIF
-- list_children          -> direct children (folders + docs) of a folder
-- create_folder          -> CMIS createFolder
-- move_object            -> CMIS moveObject (cmisaction=move)
-- delete_object          -> CMIS deleteObject (cmisaction=delete)
+- list_documents_of_type_in_folder -> docs of a specific type in a folder
+- list_folders_by_type        -> folders of a custom ItemType filtered by CIF
+- list_children               -> direct children (folders + docs) of a folder
+- search_objects_by_name      -> case-insensitive substring search on cmis:name
+- create_folder               -> CMIS createFolder
+- move_object                 -> CMIS moveObject (cmisaction=move)
+- delete_object               -> CMIS deleteObject (cmisaction=delete)
 
 CMIS SQL note: The OASIS CMIS 1.1 grammar does not allow quoted identifiers.
 Type and property references in queries must be the `queryName`, not the `id`.
@@ -21,6 +23,7 @@ This client resolves queryNames automatically via getTypeDefinition.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -80,6 +83,19 @@ class CmisChild:
     content_stream_mime_type: str | None
     last_modified: str | None
     object_type_id: str | None
+
+
+@dataclass
+class CmisSearchResult:
+    """A name-search hit. Either a folder or a document."""
+    object_id: str
+    name: str
+    object_type_id: str
+    base_type_id: str
+
+    @property
+    def is_folder(self) -> bool:
+        return self.base_type_id == "cmis:folder"
 
 
 class CmisClient:
@@ -387,6 +403,129 @@ class CmisClient:
                 )
             )
         return results
+
+    async def list_documents_of_type_in_folder(
+        self,
+        repository_id: str,
+        folder_id: str,
+        doc_type_id: str,
+        *,
+        max_items: int = 1000,
+    ) -> list[CmisChild]:
+        """Documents of a specific custom type that live directly in a folder.
+
+        Used by the TUI's "File" migration mode: instead of listing all
+        children of a source folder (which folder mode does), restrict to
+        documents whose `cmis:objectTypeId` matches `doc_type_id`. Useful
+        when a customer folder has many document kinds and you want to
+        move only one kind at a time.
+        """
+        repo = self.repository(repository_id)
+        typedef = await self.get_type_definition(repository_id, doc_type_id)
+        type_qn = typedef.get("queryName") or typedef.get("query_name")
+        if not type_qn:
+            raise CmisError(
+                f"Document type {doc_type_id!r} has no queryName."
+            )
+        statement = (
+            "SELECT cmis:objectId, cmis:name, cmis:contentStreamLength, "
+            "cmis:contentStreamMimeType, cmis:lastModificationDate, "
+            "cmis:objectTypeId "
+            f"FROM {type_qn} "
+            f"WHERE IN_FOLDER({_q_literal(folder_id)})"
+        )
+        data = {
+            "cmisaction": "query",
+            "statement": statement,
+            "searchAllVersions": "false",
+            "maxItems": str(max_items),
+            "skipCount": "0",
+        }
+        resp = await self._client.post(repo.repository_url, data=data)
+        self._raise_for_status(resp)
+        payload = resp.json()
+        results: list[CmisChild] = []
+        for row in payload.get("results", []):
+            props = row.get("properties", {}) or row.get("succinctProperties", {})
+            results.append(
+                CmisChild(
+                    object_id=_prop(props, "cmis:objectId") or "",
+                    name=_prop(props, "cmis:name") or "",
+                    is_folder=False,
+                    content_stream_length=_to_int(_prop(props, "cmis:contentStreamLength")),
+                    content_stream_mime_type=_prop(props, "cmis:contentStreamMimeType"),
+                    last_modified=_prop(props, "cmis:lastModificationDate"),
+                    object_type_id=_prop(props, "cmis:objectTypeId"),
+                )
+            )
+        return results
+
+    async def search_objects_by_name(
+        self,
+        repository_id: str,
+        name_substring: str,
+        *,
+        max_items_per_kind: int = 1000,
+        page_size: int = 500,
+    ) -> list[CmisSearchResult]:
+        """Case-insensitive substring search on cmis:name.
+
+        Runs two CMIS SQL queries in parallel -- one over cmis:folder and
+        one over cmis:document -- and returns the combined hit list.
+        Uses `UPPER(cmis:name) LIKE '%UPPER_TERM%'`. The term is escaped
+        for SQL single-quote literals; LIKE wildcards (% and _) inside
+        the user's term are NOT escaped, so they act as wildcards.
+        """
+        if not name_substring:
+            return []
+        repo = self.repository(repository_id)
+        upper = name_substring.upper().replace("'", "''")
+
+        async def search_one(base_type: str) -> list[CmisSearchResult]:
+            statement = (
+                "SELECT cmis:objectId, cmis:name, cmis:objectTypeId, "
+                "cmis:baseTypeId "
+                f"FROM {base_type} "
+                f"WHERE UPPER(cmis:name) LIKE '%{upper}%'"
+            )
+            out: list[CmisSearchResult] = []
+            skip = 0
+            while len(out) < max_items_per_kind:
+                batch = min(page_size, max_items_per_kind - len(out))
+                data = {
+                    "cmisaction": "query",
+                    "statement": statement,
+                    "searchAllVersions": "false",
+                    "maxItems": str(batch),
+                    "skipCount": str(skip),
+                }
+                resp = await self._client.post(repo.repository_url, data=data)
+                self._raise_for_status(resp)
+                payload = resp.json()
+                rows = payload.get("results", []) or []
+                if not rows:
+                    break
+                rows = rows[: max_items_per_kind - len(out)]
+                for row in rows:
+                    props = row.get("properties", {}) or row.get("succinctProperties", {})
+                    out.append(
+                        CmisSearchResult(
+                            object_id=_prop(props, "cmis:objectId") or "",
+                            name=_prop(props, "cmis:name") or "",
+                            object_type_id=_prop(props, "cmis:objectTypeId") or "",
+                            base_type_id=_prop(props, "cmis:baseTypeId") or base_type,
+                        )
+                    )
+                skip += len(rows)
+                if not payload.get("hasMoreItems", False):
+                    break
+            return out
+
+        folder_hits, doc_hits = await asyncio.gather(
+            search_one("cmis:folder"),
+            search_one("cmis:document"),
+        )
+        return folder_hits + doc_hits
 
     async def move_object(
         self,
