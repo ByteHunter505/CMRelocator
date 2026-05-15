@@ -223,14 +223,14 @@ class CMRelocatorApp(App):
             return
 
         status = self.query_one("#query_status", Static)
-        status.update("[yellow]Querying folders...[/yellow]")
+        status.update("[yellow]Discovering folders (paginated)...[/yellow]")
 
         try:
-            source_folders = await self._client.list_folders_by_type(
-                self._repo_id, source_type, cif=cif or None, max_items=max(1000, max_docs * 2)
+            source_folders, src_hit_cap = await self._client.list_folders_by_type(
+                self._repo_id, source_type, cif=cif or None
             )
-            target_folders = await self._client.list_folders_by_type(
-                self._repo_id, target_type, cif=cif or None, max_items=max(1000, max_docs * 2)
+            target_folders, tgt_hit_cap = await self._client.list_folders_by_type(
+                self._repo_id, target_type, cif=cif or None
             )
         except Exception as exc:
             status.update("[red]Folder query failed[/red]")
@@ -242,48 +242,66 @@ class CMRelocatorApp(App):
             self._log("[red]No source folders matched.[/red]")
             return
 
+        self._log(
+            f"[cyan]Discovery:[/cyan] {len(source_folders)} source folders, "
+            f"{len(target_folders)} target folders"
+            + (" [yellow](source fetch hit internal cap of 50000; "
+               "narrow with CIF if you have more)[/yellow]" if src_hit_cap else "")
+            + (" [yellow](target fetch hit internal cap of 50000)[/yellow]"
+               if tgt_hit_cap else "")
+        )
+
         target_by_cif: dict[str, str] = {}
+        target_dupes = 0
         for tf in target_folders:
             if not tf.cif:
                 continue
             if tf.cif in target_by_cif:
-                self._log(
-                    f"[yellow]Multiple target folders for CIF {tf.cif}; "
-                    f"using first (1:1 assumption).[/yellow]"
-                )
+                target_dupes += 1
                 continue
             target_by_cif[tf.cif] = tf.object_id
 
-        pairs: list[tuple[str, str, str]] = []
-        seen_cifs: set[str] = set()
+        source_by_cif: dict[str, str] = {}
+        source_dupes = 0
+        source_no_cif = 0
         for sf in source_folders:
             if not sf.cif:
-                self._log(
-                    f"[yellow]Source folder {sf.object_id} has no CIF; skipping.[/yellow]"
-                )
+                source_no_cif += 1
                 continue
-            if sf.cif in seen_cifs:
-                self._log(
-                    f"[yellow]Multiple source folders for CIF {sf.cif}; "
-                    f"using first (1:1 assumption).[/yellow]"
-                )
+            if sf.cif in source_by_cif:
+                source_dupes += 1
                 continue
-            seen_cifs.add(sf.cif)
-            target_id = target_by_cif.get(sf.cif)
-            if not target_id:
-                self._log(
-                    f"[yellow]CIF {sf.cif}: no matching target folder; skipping.[/yellow]"
-                )
-                continue
-            pairs.append((sf.cif, sf.object_id, target_id))
+            source_by_cif[sf.cif] = sf.object_id
+
+        cifs_src = set(source_by_cif.keys())
+        cifs_tgt = set(target_by_cif.keys())
+        matched_cifs = cifs_src & cifs_tgt
+        only_source = cifs_src - cifs_tgt
+        only_target = cifs_tgt - cifs_src
+
+        pairs: list[tuple[str, str, str]] = [
+            (c, source_by_cif[c], target_by_cif[c]) for c in sorted(matched_cifs)
+        ]
+
+        self._log(
+            f"[cyan]Matching:[/cyan] {len(matched_cifs)} pairs ready  |  "
+            f"orphans: {len(only_source)} src-only (skipped), "
+            f"{len(only_target)} tgt-only (skipped)  |  "
+            f"dupes ignored: {source_dupes} src, {target_dupes} tgt"
+            + (f"  |  {source_no_cif} src folders without CIF (skipped)"
+               if source_no_cif else "")
+        )
 
         if not pairs:
             status.update("[red]No matching source/target pairs[/red]")
-            self._log("[red]No source/target folder pairs found.[/red]")
+            self._log(
+                "[red]No source/target folder pairs found. "
+                "Source and target types don't share CIFs.[/red]"
+            )
             return
 
         status.update(
-            f"[yellow]Listing items in {len(pairs)} folder(s)...[/yellow]"
+            f"[yellow]Listing documents in {len(pairs)} folder(s)...[/yellow]"
         )
 
         sem = asyncio.Semaphore(concurrency)

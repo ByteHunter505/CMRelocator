@@ -229,51 +229,76 @@ class CmisClient:
         *,
         cif: str | None = None,
         cif_property: str = "clbNonGroup-BAC_CIF",
-        max_items: int = 5000,
-    ) -> list[CmisFolder]:
-        """Query folders of a custom ItemType, optionally filtering by CIF.
+        max_items: int = 50_000,
+        page_size: int = 500,
+    ) -> tuple[list[CmisFolder], bool]:
+        """Query folders of a custom ItemType, paginated via skipCount.
 
-        Resolves the type's queryName and the CIF property's queryName via
-        getTypeDefinition, because CMIS SQL does not accept the raw ids when
-        they contain special characters (`$`, `!`, `-`, etc.).
+        Resolves queryName for both the type and the CIF property (the CMIS
+        SQL grammar does not allow quoted identifiers).
+
+        Pages through `skipCount` in batches of `page_size` until the server
+        reports no more items, or `max_items` is reached.
+
+        Returns (folders, hit_cap) where `hit_cap` is True iff we stopped
+        because we reached `max_items` (vs. because the server said there
+        were no more results). The caller can use that to warn the user
+        their `max_items` may be too tight.
         """
         repo = self.repository(repository_id)
         type_qn, cif_qn = await self.resolve_query_names(
             repository_id, type_id, cif_property
         )
-        statement = (
+        statement_base = (
             f"SELECT cmis:objectId, cmis:name, cmis:objectTypeId, {cif_qn} "
             f"FROM {type_qn}"
         )
         if cif:
-            statement += f" WHERE {cif_qn} = {_q_literal(cif)}"
-        data = {
-            "cmisaction": "query",
-            "statement": statement,
-            "searchAllVersions": "false",
-            "maxItems": str(max_items),
-            "skipCount": "0",
-        }
-        resp = await self._client.post(repo.repository_url, data=data)
-        self._raise_for_status(resp)
-        payload = resp.json()
+            statement_base += f" WHERE {cif_qn} = {_q_literal(cif)}"
+
         folders: list[CmisFolder] = []
-        for row in payload.get("results", []):
-            props = row.get("properties", {}) or row.get("succinctProperties", {})
-            # In query results, properties may be keyed by queryName (standard
-            # mode) or by id (succinct mode). Try both.
-            cif_val = _prop(props, cif_qn)
-            if cif_val is None:
-                cif_val = _prop(props, cif_property)
-            folders.append(
-                CmisFolder(
-                    object_id=_prop(props, "cmis:objectId") or "",
-                    name=_prop(props, "cmis:name") or "",
-                    cif="" if cif_val is None else str(cif_val),
-                    object_type_id=_prop(props, "cmis:objectTypeId") or type_id,
+        skip = 0
+        hit_cap = False
+        while len(folders) < max_items:
+            batch = min(page_size, max_items - len(folders))
+            data = {
+                "cmisaction": "query",
+                "statement": statement_base,
+                "searchAllVersions": "false",
+                "maxItems": str(batch),
+                "skipCount": str(skip),
+            }
+            resp = await self._client.post(repo.repository_url, data=data)
+            self._raise_for_status(resp)
+            payload = resp.json()
+            results = payload.get("results", []) or []
+            if not results:
+                break
+            # Defensive: some servers ignore maxItems and return more rows
+            # than requested. Clip to the remaining budget so we honour
+            # max_items strictly.
+            remaining = max_items - len(folders)
+            results = results[:remaining]
+            for row in results:
+                props = row.get("properties", {}) or row.get("succinctProperties", {})
+                cif_val = _prop(props, cif_qn)
+                if cif_val is None:
+                    cif_val = _prop(props, cif_property)
+                folders.append(
+                    CmisFolder(
+                        object_id=_prop(props, "cmis:objectId") or "",
+                        name=_prop(props, "cmis:name") or "",
+                        cif="" if cif_val is None else str(cif_val),
+                        object_type_id=_prop(props, "cmis:objectTypeId") or type_id,
+                    )
                 )
-            )
-        return folders
+            skip += len(results)
+            if not payload.get("hasMoreItems", False):
+                break
+        else:
+            # Loop exited via `while` condition (not `break`) -> we hit the cap.
+            hit_cap = True
+        return folders, hit_cap
 
     async def list_children(
         self,
