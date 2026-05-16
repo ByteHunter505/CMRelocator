@@ -15,6 +15,7 @@ Only the operations needed by CMRelocator are implemented:
 - search_by_property          -> LIKE substring search on a custom property of a type
 - create_folder               -> CMIS createFolder
 - move_object                 -> CMIS moveObject (cmisaction=move)
+- unfile_object               -> CMIS removeObjectFromFolder (multi-file fallback)
 - delete_object               -> CMIS deleteObject (cmisaction=delete)
 
 CMIS SQL note: The OASIS CMIS 1.1 grammar does not allow quoted identifiers.
@@ -885,6 +886,30 @@ class CmisClient:
             return resp.json()
         except ValueError:
             return {}
+
+    async def unfile_object(
+        self,
+        repository_id: str,
+        object_id: str,
+        folder_id: str,
+    ) -> None:
+        """CMIS removeObjectFromFolder.
+
+        Removes the link between `object_id` and `folder_id` without
+        deleting the object. The object remains in any other folders
+        it is filed in. Used to resolve the multi-filing case where a
+        `moveObject` to a target folder fails because the document is
+        already linked there: removing the source-side link achieves
+        the same end state (doc present only at target).
+        """
+        repo = self.repository(repository_id)
+        data = {
+            "cmisaction": "removeObjectFromFolder",
+            "objectId": object_id,
+            "folderId": folder_id,
+        }
+        resp = await self._client.post(repo.root_folder_url, data=data)
+        self._raise_for_status(resp)
 
     async def create_folder(
         self,
