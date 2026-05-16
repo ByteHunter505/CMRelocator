@@ -54,7 +54,7 @@ class CMRelocatorApp(App):
 
     #conn-area {
         height: auto;
-        max-height: 14;
+        max-height: 16;
     }
 
     #connection, #matching, #search-panel {
