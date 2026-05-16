@@ -824,7 +824,7 @@ class CMRelocatorApp(App):
         )
 
         sem = asyncio.Semaphore(concurrency)
-        counters = {"ok": 0, "fail": 0}
+        counters = {"ok": 0, "unfiled": 0, "fail": 0}
 
         async def move_one(idx: int, row: ItemRow) -> None:
             async with sem:
@@ -844,6 +844,58 @@ class CMRelocatorApp(App):
                         f"[green]OK[/green]   CIF {row.cif} {kind} {row.item.name}"
                     )
                 except CmisError as exc:
+                    # Multi-file fallback: when moveObject fails because the
+                    # target is already a parent of the object, "removing
+                    # the source link" produces the same end state as the
+                    # caller intended ("doc only at target"). We only take
+                    # that path if we confirm the target really is a
+                    # current parent -- otherwise the conflict is a genuine
+                    # name collision and we must not silently unfile.
+                    if _looks_like_target_conflict(exc):
+                        try:
+                            parents = await self._client.get_object_parents(  # type: ignore[union-attr]
+                                self._repo_id, row.item.object_id
+                            )
+                        except Exception as probe_exc:
+                            row.status = "error"
+                            row.error = (
+                                f"{exc} | parent-probe failed: {probe_exc}"
+                            )
+                            counters["fail"] += 1
+                            self._log(
+                                f"[red]FAIL[/red] CIF {row.cif} {kind} "
+                                f"{row.item.name}: {row.error}"
+                            )
+                            return
+                        if row.target_folder_id in parents:
+                            try:
+                                await self._client.unfile_object(  # type: ignore[union-attr]
+                                    self._repo_id,
+                                    row.item.object_id,
+                                    row.source_folder_id,
+                                )
+                                row.status = "done"
+                                counters["unfiled"] += 1
+                                self._log(
+                                    f"[green]OK[/green]   CIF {row.cif} {kind} "
+                                    f"{row.item.name} [dim](multi-filed; "
+                                    f"unfiled from source)[/dim]"
+                                )
+                                return
+                            except Exception as unfile_exc:
+                                row.status = "error"
+                                row.error = (
+                                    f"{exc} | unfile failed: {unfile_exc}"
+                                )
+                                counters["fail"] += 1
+                                self._log(
+                                    f"[red]FAIL[/red] CIF {row.cif} {kind} "
+                                    f"{row.item.name}: {row.error}"
+                                )
+                                return
+                        # Target NOT a parent -> genuine name collision,
+                        # fall through to the normal error path so the
+                        # user sees it.
                     row.status = "error"
                     row.error = str(exc)
                     counters["fail"] += 1
@@ -862,9 +914,11 @@ class CMRelocatorApp(App):
                     progress.advance(1)
 
         await asyncio.gather(*(move_one(i, r) for i, r in targets))
+        unfiled = counters['unfiled']
         self._log(
-            f"[bold]Done.[/bold] ok={counters['ok']}  fail={counters['fail']}  "
-            f"total={len(targets)}"
+            f"[bold]Done.[/bold] ok={counters['ok']}"
+            + (f"  unfiled={unfiled}" if unfiled else "")
+            + f"  fail={counters['fail']}  total={len(targets)}"
         )
 
         if self.query_one("#opt_delete_source", Checkbox).value:
@@ -1462,6 +1516,25 @@ def _status_text(status: str, error: str) -> Text:
     if status == "error":
         return Text(f"ERR {error[:40]}", style="bold red")
     return Text(status)
+
+
+def _looks_like_target_conflict(exc: CmisError) -> bool:
+    """True iff a CmisError raised by moveObject reads as "the object is
+    already linked at the target".
+
+    Match is fuzzy on purpose: CM v8's wording is "Document with name X
+    and ID already exists under the target parent folder. The item might
+    have been moved by another user or process." Other CMIS servers
+    return shorter phrases; HTTP 409 with "duplicate" / "exists" / "name
+    constraint" in the body all qualify. Anything else falls through to
+    the generic error path so we never silently unfile on an unrelated
+    failure.
+    """
+    msg = str(exc).lower()
+    if exc.status_code == 409:
+        return True
+    keywords = ("already exists", "duplicate", "name constraint")
+    return any(k in msg for k in keywords)
 
 
 def _safe_int(
