@@ -54,7 +54,7 @@ class CMRelocatorApp(App):
 
     #conn-area {
         height: auto;
-        max-height: 16;
+        max-height: 13;
     }
 
     #connection, #matching, #search-panel {
@@ -96,15 +96,17 @@ class CMRelocatorApp(App):
         background: transparent;
     }
 
-    /* Breathing room between sibling rows inside each panel -- without
-       this, height-1 Inputs and the panel border crash into each other
-       and everything looks crammed. */
-    #connection > Horizontal,
+    /* Breathing room between sibling rows inside the working form
+       panels -- without this, height-1 Inputs and the panel border
+       crash into each other and everything looks crammed.
+       #connection is intentionally excluded: its 3-row Connect Button
+       blew the conn-area scroll budget when combined with margins,
+       hiding the Service URL and Username rows on first paint. The
+       connection panel is one-shot anyway and reads fine compact. */
     #matching > Horizontal,
     #search-panel > Horizontal {
         margin-bottom: 1;
     }
-    #connection > Static,
     #matching > Static,
     #search-panel > Static {
         margin-bottom: 1;
