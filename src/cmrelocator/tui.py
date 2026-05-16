@@ -54,17 +54,21 @@ class CMRelocatorApp(App):
 
     #conn-area {
         height: auto;
-        max-height: 10;
+        max-height: 14;
     }
 
     #connection, #matching, #search-panel {
         height: auto;
         border: round $accent;
-        padding: 0 1;
+        padding: 1 1;
         margin: 1 1 0 1;
     }
 
-    #migrate-form, #search-form {
+    #migrate-form {
+        height: auto;
+        max-height: 29;
+    }
+    #search-form {
         height: auto;
         max-height: 24;
     }
@@ -85,11 +89,25 @@ class CMRelocatorApp(App):
         width: 1fr;
     }
     Checkbox {
-        margin: 0 1;
+        margin: 0 1 1 1;
         height: 1;
         border: none;
         padding: 0 1;
         background: transparent;
+    }
+
+    /* Breathing room between sibling rows inside each panel -- without
+       this, height-1 Inputs and the panel border crash into each other
+       and everything looks crammed. */
+    #connection > Horizontal,
+    #matching > Horizontal,
+    #search-panel > Horizontal {
+        margin-bottom: 1;
+    }
+    #connection > Static,
+    #matching > Static,
+    #search-panel > Static {
+        margin-bottom: 1;
     }
 
     /* The one row that holds a Select keeps its native 3-row height. */
@@ -98,7 +116,7 @@ class CMRelocatorApp(App):
 
     #selected_type_row {
         height: 1;
-        margin: 0 1;
+        margin: 0 1 1 1;
     }
 
     #actions {
@@ -223,6 +241,14 @@ class CMRelocatorApp(App):
                             yield Label("Max items", classes="field")
                             yield Input(
                                 value="5000", id="max_docs", restrict=r"[0-9]*"
+                            )
+                        with Horizontal():
+                            yield Label("Fetch cap", classes="field")
+                            yield Input(
+                                value="50000",
+                                id="fetch_cap",
+                                restrict=r"[0-9]*",
+                                placeholder="circuit-breaker on folder/doc discovery (paginated)",
                             )
                         with Horizontal():
                             yield Label("Max parallel", classes="field")
@@ -422,6 +448,9 @@ class CMRelocatorApp(App):
         max_docs = _safe_int(
             self.query_one("#max_docs", Input).value, default=5000, lo=1
         )
+        fetch_cap = _safe_int(
+            self.query_one("#fetch_cap", Input).value, default=50_000, lo=1
+        )
         concurrency = _safe_int(
             self.query_one("#concurrency", Input).value, default=4, lo=1, hi=16
         )
@@ -453,6 +482,7 @@ class CMRelocatorApp(App):
                 cif=cif,
                 cif_property=cif_property,
                 max_docs=max_docs,
+                fetch_cap=fetch_cap,
                 concurrency=concurrency,
                 opt_create_target=opt_create_target,
             )
@@ -467,12 +497,14 @@ class CMRelocatorApp(App):
                 source_type,
                 cif=cif or None,
                 cif_property=cif_property,
+                max_items=fetch_cap,
             )
             target_folders, tgt_hit_cap = await self._client.list_folders_by_type(
                 self._repo_id,
                 target_type,
                 cif=cif or None,
                 cif_property=cif_property,
+                max_items=fetch_cap,
             )
         except Exception as exc:
             status.update("[red]Folder query failed[/red]")
@@ -489,7 +521,7 @@ class CMRelocatorApp(App):
             f"[cyan]Discovery ({mode_label}):[/cyan] {len(source_folders)} source folders, "
             f"{len(target_folders)} target folders"
             + (
-                " [yellow](source fetch hit cap of 50000)[/yellow]"
+                f" [yellow](source fetch hit cap of {fetch_cap})[/yellow]"
                 if src_hit_cap
                 else ""
             )
@@ -1034,6 +1066,7 @@ class CMRelocatorApp(App):
         cif: str,
         cif_property: str,
         max_docs: int,
+        fetch_cap: int,
         concurrency: int,
         opt_create_target: bool,
     ) -> None:
@@ -1055,12 +1088,14 @@ class CMRelocatorApp(App):
                 doc_type,
                 cif=cif or None,
                 cif_property=cif_property,
+                max_items=fetch_cap,
             )
             target_folders, tgt_hit_cap = await self._client.list_folders_by_type(  # type: ignore[union-attr]
                 self._repo_id,
                 target_type,
                 cif=cif or None,
                 cif_property=cif_property,
+                max_items=fetch_cap,
             )
         except Exception as exc:
             status.update("[red]Discovery failed[/red]")
@@ -1079,12 +1114,12 @@ class CMRelocatorApp(App):
             f"[cyan]Discovery (FILE-by-doc-CIF):[/cyan] "
             f"{len(doc_pairs)} document(s), {len(target_folders)} target folder(s)"
             + (
-                " [yellow](doc fetch hit cap of 50000)[/yellow]"
+                f" [yellow](doc fetch hit cap of {fetch_cap})[/yellow]"
                 if doc_hit_cap
                 else ""
             )
             + (
-                " [yellow](target fetch hit cap of 50000)[/yellow]"
+                f" [yellow](target fetch hit cap of {fetch_cap})[/yellow]"
                 if tgt_hit_cap
                 else ""
             )
